@@ -9,6 +9,10 @@ no other containers attached and no host port mapping. Do not connect applicatio
 ChromaDB until its version/runtime has a verified mitigation for the cited issue. Nginx and
 OAuth2 Proxy join `apex-internal`; OAuth2 Proxy additionally needs outbound access to GitHub on
 `apex-egress` to complete OAuth. Neither container publishes a host port.
+The current OCI Docker Snap runtime returns `operation not permitted` when containers use
+`no-new-privileges:true`, so this deployment omits that option. Validate runtime support before
+reintroducing it; Streamlit still uses a read-only filesystem, a non-root UID, and dropped
+capabilities.
 
 The CVE-2026-45829 record currently describes affected ChromaDB versions as 1.0.0 and later. Its
 referenced report says the Python backend can execute an untrusted embedding model before the

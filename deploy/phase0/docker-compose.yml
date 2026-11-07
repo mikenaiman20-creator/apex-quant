@@ -12,8 +12,6 @@ services:
       - chroma_data:/chroma/chroma
     networks:
       - chroma-isolated
-    security_opt:
-      - no-new-privileges:true
 
   streamlit:
     build:
@@ -45,8 +43,6 @@ services:
     read_only: true
     tmpfs:
       - /tmp:size=32m,noexec,nosuid
-    security_opt:
-      - no-new-privileges:true
     cap_drop:
       - ALL
     healthcheck:
@@ -88,8 +84,6 @@ services:
       - egress
     expose:
       - "4180"
-    security_opt:
-      - no-new-privileges:true
 
   nginx:
     image: ${NGINX_IMAGE:?Set NGINX_IMAGE to a verified, digest-pinned image}
@@ -107,8 +101,6 @@ services:
     networks:
       - apex-internal
       - egress
-    security_opt:
-      - no-new-privileges:true
 
 networks:
   apex-internal:
