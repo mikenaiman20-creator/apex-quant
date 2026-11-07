@@ -31,6 +31,8 @@ APEX_RUNTIME_GID=1001
 The digest must identify an official Certbot image manifest that supports the OCI ARM64
 architecture. Keep `deployment.env` mode `600`. Existing verified Nginx, OAuth2 Proxy, Python,
 and Chroma image digests remain in that same file.
+Use Docker Compose v2.24.4 or newer; the Phase 1 overlay replaces the Phase 0 certificate mounts
+so the temporary ACME setup can start before a certificate exists.
 The Streamlit container runs as this unprivileged host UID/GID so it can read the mode-`700`
 production data and log directories without making those files world-readable. Verify the values
 against `id -u ubuntu` and `id -g ubuntu` before starting the stack.
@@ -117,8 +119,9 @@ sudo systemctl enable --now apex-certbot-renew.timer
 sudo systemctl list-timers apex-certbot-renew.timer --no-pager
 ```
 
-The `ubuntu` service account must be able to access the Docker socket; verify with
-`sudo -u ubuntu docker info` before enabling the timer.
+The renewal systemd service runs as root to access the Docker socket without granting the
+`ubuntu` account broad Docker-group privileges. Verify Docker access with `sudo docker info`
+before enabling the timer.
 
 The timer runs `certbot renew` twice daily and reloads Nginx only after a successful renewal
 command. Check its first dry run without changing certificates:
