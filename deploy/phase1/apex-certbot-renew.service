@@ -7,5 +7,5 @@ Requires=docker.service
 Type=oneshot
 User=root
 WorkingDirectory=/home/ubuntu/apex_quant
-ExecStart=/usr/bin/docker compose --env-file /home/ubuntu/apex_quant/deploy/phase0/deployment.env -f /home/ubuntu/apex_quant/deploy/phase0/docker-compose.yml -f /home/ubuntu/apex_quant/deploy/phase1/docker-compose.phase1.yml --profile certbot run --rm certbot renew --webroot --webroot-path /var/www/certbot --quiet
-ExecStartPost=/usr/bin/docker compose --env-file /home/ubuntu/apex_quant/deploy/phase0/deployment.env -f /home/ubuntu/apex_quant/deploy/phase0/docker-compose.yml -f /home/ubuntu/apex_quant/deploy/phase1/docker-compose.phase1.yml exec -T nginx nginx -s reload
+ExecStart=/usr/bin/docker compose -p apex-project --env-file /home/ubuntu/apex_quant/deploy/phase0/deployment.env -f /home/ubuntu/apex_quant/deploy/phase0/docker-compose.yml -f /home/ubuntu/apex_quant/deploy/phase1/docker-compose.phase1.yml --profile certbot run --rm certbot renew --webroot --webroot-path /var/www/certbot --quiet
+ExecStartPost=/usr/bin/docker compose -p apex-project --env-file /home/ubuntu/apex_quant/deploy/phase0/deployment.env -f /home/ubuntu/apex_quant/deploy/phase0/docker-compose.yml -f /home/ubuntu/apex_quant/deploy/phase1/docker-compose.phase1.yml exec -T nginx nginx -s reload

@@ -15,6 +15,8 @@ host. Never run `docker compose down --volumes` for this stack.
 
 Copy this directory and the updated `app.py` and `server/autonomous_runner.py` to
 `/home/ubuntu/apex_quant`. Keep the running production `data/` and `logs/` directories intact.
+Use Compose project name `apex-project` for every command below; it preserves the existing
+`apex-project_chroma_data` named volume across the deployment.
 
 Append these values to the existing, permission-restricted
 `deploy/phase0/deployment.env`, replacing the Certbot image example with the verified ARM64
@@ -76,13 +78,13 @@ Start the temporary HTTP-only Nginx config, which serves ACME challenges and ret
 other paths while the certificate is being issued:
 
 ```bash
-docker compose --env-file deploy/phase0/deployment.env \
+docker compose -p apex-project --env-file deploy/phase0/deployment.env \
   -f deploy/phase0/docker-compose.yml \
   -f deploy/phase1/docker-compose.phase1.yml \
   -f deploy/phase1/docker-compose.acme.yml \
   up -d nginx
 
-docker compose --env-file deploy/phase0/deployment.env \
+docker compose -p apex-project --env-file deploy/phase0/deployment.env \
   -f deploy/phase0/docker-compose.yml \
   -f deploy/phase1/docker-compose.phase1.yml \
   -f deploy/phase1/docker-compose.acme.yml \
@@ -99,7 +101,7 @@ sudo test -s /etc/letsencrypt/live/151.145.93.209.nip.io/privkey.pem
 Start the authenticated HTTPS Nginx config and application:
 
 ```bash
-docker compose --env-file deploy/phase0/deployment.env \
+docker compose -p apex-project --env-file deploy/phase0/deployment.env \
   -f deploy/phase0/docker-compose.yml \
   -f deploy/phase1/docker-compose.phase1.yml \
   up -d --build
@@ -127,7 +129,7 @@ The timer runs `certbot renew` twice daily and reloads Nginx only after a succes
 command. Check its first dry run without changing certificates:
 
 ```bash
-docker compose --env-file deploy/phase0/deployment.env \
+docker compose -p apex-project --env-file deploy/phase0/deployment.env \
   -f deploy/phase0/docker-compose.yml \
   -f deploy/phase1/docker-compose.phase1.yml \
   --profile certbot run --rm certbot renew --dry-run \
@@ -141,11 +143,11 @@ The Compose stack stores ChromaDB under the named `chroma_data` volume and maps 
 (`backtest/`, `config/`, `engine/`, `server/`) are also mounted read-only. Verify mounts:
 
 ```bash
-docker compose --env-file deploy/phase0/deployment.env \
+docker compose -p apex-project --env-file deploy/phase0/deployment.env \
   -f deploy/phase0/docker-compose.yml \
   -f deploy/phase1/docker-compose.phase1.yml \
   ps
-docker inspect "$(docker compose --env-file deploy/phase0/deployment.env \
+docker inspect "$(docker compose -p apex-project --env-file deploy/phase0/deployment.env \
   -f deploy/phase0/docker-compose.yml \
   -f deploy/phase1/docker-compose.phase1.yml ps -q chromadb)" \
   --format '{{json .Mounts}}'
@@ -173,7 +175,7 @@ After restarting the runner unit, verify:
 ```bash
 python3 -c "import json,pathlib; p=pathlib.Path('logs/paper_dashboard_snapshot.json'); d=json.loads(p.read_text()); print(d['timestamp'], d['paper_api_status'], d['mode'], len(d['positions']), len(d['orders']))"
 sqlite3 -readonly data/knowledge_brain.sqlite 'PRAGMA quick_check;'
-docker compose --env-file deploy/phase0/deployment.env \
+docker compose -p apex-project --env-file deploy/phase0/deployment.env \
   -f deploy/phase0/docker-compose.yml \
   -f deploy/phase1/docker-compose.phase1.yml \
   exec -T streamlit python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health').read().decode())"

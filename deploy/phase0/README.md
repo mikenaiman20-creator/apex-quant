@@ -90,11 +90,11 @@ cd /home/ubuntu/apex_quant
 docker network inspect apex-internal >/dev/null 2>&1 || \
   docker network create --internal apex-internal
 test "$(docker network inspect apex-internal --format '{{.Internal}}')" = true
-docker compose --env-file deploy/phase0/deployment.env \
+docker compose -p apex-project --env-file deploy/phase0/deployment.env \
   -f deploy/phase0/docker-compose.yml config
-docker compose --env-file deploy/phase0/deployment.env \
+docker compose -p apex-project --env-file deploy/phase0/deployment.env \
   -f deploy/phase0/docker-compose.yml up --build -d
-docker compose --env-file deploy/phase0/deployment.env \
+docker compose -p apex-project --env-file deploy/phase0/deployment.env \
   -f deploy/phase0/docker-compose.yml ps
 docker network inspect apex-internal
 ```
@@ -137,7 +137,7 @@ Verify that Streamlit and ChromaDB are not reachable from outside the VM:
 ```bash
 sudo ss -lntp | grep -E ':(8501|8000)\b' && echo "Unexpected published service port" && exit 1 || true
 docker port chromadb
-docker port "$(docker compose --env-file deploy/phase0/deployment.env \
+docker port "$(docker compose -p apex-project --env-file deploy/phase0/deployment.env \
   -f deploy/phase0/docker-compose.yml ps -q streamlit)"
 ```
 
