@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Apex Quant backtest daily at midnight UTC
+
+[Timer]
+OnCalendar=*-*-* 00:00:00 UTC
+Persistent=true
+Unit=apex_quant.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=Apex Quant daily historical walk-forward backtest
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/apex_quant
+EnvironmentFile=/home/ubuntu/apex_quant/.env
+ExecStart=/home/ubuntu/miniforge3/envs/apex_env/bin/python -u -m backtest.cli run --csv-dir data --symbols SPY QQQ NVDA --walk-forward-only --workers 4
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=2h
+Restart=no

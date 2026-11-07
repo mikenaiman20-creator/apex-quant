@@ -1,0 +1,125 @@
+services:
+  chromadb:
+    profiles:
+      - isolated-chroma
+    image: ${CHROMA_IMAGE:?Set CHROMA_IMAGE to a verified, digest-pinned image}
+    restart: unless-stopped
+    environment:
+      IS_PERSISTENT: "TRUE"
+      PERSIST_DIRECTORY: /chroma/chroma
+      ANONYMIZED_TELEMETRY: "FALSE"
+    volumes:
+      - chroma_data:/chroma/chroma
+    networks:
+      - chroma-isolated
+    security_opt:
+      - no-new-privileges:true
+
+  streamlit:
+    build:
+      context: ../..
+      dockerfile: deploy/phase0/Dockerfile
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:?Set PYTHON_IMAGE to a verified, digest-pinned image}
+    restart: unless-stopped
+    environment:
+      HOME: /tmp
+      STREAMLIT_CONFIG_DIR: /tmp/.streamlit
+      XDG_CACHE_HOME: /tmp/.cache
+    command:
+      - streamlit
+      - run
+      - /app/app.py
+      - --server.address=0.0.0.0
+      - --server.port=8501
+      - --server.headless=true
+      - --browser.gatherUsageStats=false
+    volumes:
+      - /home/ubuntu/apex_quant/app.py:/app/app.py:ro
+      - /home/ubuntu/apex_quant/logs:/app/logs:ro
+      - /home/ubuntu/apex_quant/data:/app/data:ro
+    networks:
+      - apex-internal
+    expose:
+      - "8501"
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,noexec,nosuid
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=2)"
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+
+  oauth2-proxy:
+    image: ${OAUTH2_PROXY_IMAGE:?Set OAUTH2_PROXY_IMAGE to a verified, digest-pinned image}
+    restart: unless-stopped
+    env_file:
+      - ./oauth2-proxy.env
+    command:
+      - --http-address=0.0.0.0:4180
+      - --provider=github
+      - --scope=user:email
+      - --email-domain=*
+      - --authenticated-emails-file=/etc/oauth2-proxy/allowed_emails
+      - --redirect-url=https://151.145.93.209.nip.io/oauth2/callback
+      - --cookie-domain=151.145.93.209.nip.io
+      - --upstream=static://200
+      - --skip-provider-button=true
+      - --reverse-proxy=true
+      - --set-xauthrequest=true
+      - --cookie-secure=true
+      - --cookie-samesite=lax
+      - --standard-logging=true
+      - --auth-logging=true
+    volumes:
+      - ./allowed_emails:/etc/oauth2-proxy/allowed_emails:ro
+    networks:
+      - apex-internal
+      - egress
+    expose:
+      - "4180"
+    security_opt:
+      - no-new-privileges:true
+
+  nginx:
+    image: ${NGINX_IMAGE:?Set NGINX_IMAGE to a verified, digest-pinned image}
+    restart: unless-stopped
+    depends_on:
+      - oauth2-proxy
+      - streamlit
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./certs/server.crt:/etc/nginx/certs/server.crt:ro
+      - ./certs/server.key:/etc/nginx/certs/server.key:ro
+    networks:
+      - apex-internal
+      - egress
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  apex-internal:
+    name: apex-internal
+    internal: true
+  chroma-isolated:
+    name: apex-chroma-isolated
+    internal: true
+  egress:
+    name: apex-egress
+    driver: bridge
+
+volumes:
+  chroma_data:

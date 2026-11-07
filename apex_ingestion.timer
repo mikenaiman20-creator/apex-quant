@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Apex Quant research ingestion every three hours
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=180min
+AccuracySec=1min
+Unit=apex_ingestion.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,17 @@
+[Unit]
+Description=Apex Quant scheduled Gemini research ingestion
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/apex_quant
+EnvironmentFile=/home/ubuntu/apex_quant/.env
+Environment=PYTHONPATH=/home/ubuntu/apex_quant
+ExecStartPre=/usr/bin/test -f /home/ubuntu/apex_quant/server/ingestion/cli.py
+ExecStart=/home/ubuntu/miniforge3/envs/apex_env/bin/python -u -m server.ingestion.cli
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=30min
+Restart=no

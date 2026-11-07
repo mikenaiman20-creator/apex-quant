@@ -1,0 +1,11 @@
+[Unit]
+Description=Renew Apex Quant Let's Encrypt certificate
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/apex_quant
+ExecStart=/usr/bin/docker compose --env-file /home/ubuntu/apex_quant/deploy/phase0/deployment.env -f /home/ubuntu/apex_quant/deploy/phase0/docker-compose.yml -f /home/ubuntu/apex_quant/deploy/phase1/docker-compose.phase1.yml --profile certbot run --rm certbot renew --webroot --webroot-path /var/www/certbot --quiet
+ExecStartPost=/usr/bin/docker compose --env-file /home/ubuntu/apex_quant/deploy/phase0/deployment.env -f /home/ubuntu/apex_quant/deploy/phase0/docker-compose.yml -f /home/ubuntu/apex_quant/deploy/phase1/docker-compose.phase1.yml exec -T nginx nginx -s reload

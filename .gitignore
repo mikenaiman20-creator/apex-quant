@@ -1,0 +1,8 @@
+.env
+.env.*
+!.env.example
+ssh-key-*.key
+deploy/phase0/deployment.env
+deploy/phase0/oauth2-proxy.env
+deploy/phase0/certs/
+.certbot-webroot/

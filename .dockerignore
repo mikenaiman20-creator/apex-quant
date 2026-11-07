@@ -1,0 +1,5 @@
+**
+!app.py
+!deploy/
+!deploy/phase0/
+!deploy/phase0/requirements.txt

@@ -1,0 +1,936 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>ApexQuant Monitor</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0c111b;
+      --panel: #151d2b;
+      --panel-soft: #101725;
+      --line: #273449;
+      --text: #edf2fb;
+      --muted: #91a0b8;
+      --green: #41d69a;
+      --yellow: #f4c968;
+      --red: #ff6f7d;
+      --blue: #7cb4ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: radial-gradient(ellipse at 10% -15%, #1b2940 0, transparent 40%), var(--bg);
+      color: var(--text);
+      font: 14px/1.5 "Segoe UI", system-ui, sans-serif;
+    }
+    main { max-width: 1440px; margin: auto; padding: 28px clamp(16px, 3vw, 42px) 48px; }
+    header { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:22px; }
+    h1 { margin:0; font-size:clamp(22px, 3vw, 32px); letter-spacing:-.04em; }
+    h2 { margin:0 0 16px; font-size:15px; letter-spacing:.01em; }
+    .sub,.muted { color:var(--muted); }
+    .sub { margin-top:3px; }
+    .refresh { color:var(--muted); font-size:12px; text-align:right; }
+    .grid { display:grid; gap:14px; }
+    .summary { grid-template-columns:repeat(5,minmax(0,1fr)); margin-bottom:14px; }
+    .two { grid-template-columns:minmax(0,1.05fr) minmax(0,1.35fr); margin-bottom:14px; }
+    .three { grid-template-columns:minmax(0,1fr) minmax(0,1fr) minmax(300px,1.3fr); margin-bottom:14px; }
+    .panel,.card { border:1px solid var(--line); background:linear-gradient(145deg,#172131,var(--panel)); border-radius:14px; }
+    .panel { padding:18px; min-width:0; }
+    .card { padding:17px 18px; min-height:104px; }
+    .readiness-card { display:flex; align-items:center; gap:13px; }
+    .readiness-ring {
+      flex:0 0 72px;
+      width:72px;
+      height:72px;
+      display:grid;
+      place-items:center;
+      border-radius:50%;
+      background:conic-gradient(var(--blue) var(--readiness-progress,0%),#2b3a51 0);
+    }
+    .readiness-ring-inner {
+      width:58px;
+      height:58px;
+      display:grid;
+      place-items:center;
+      border:1px solid #31445b;
+      border-radius:50%;
+      background:#151d2b;
+      font-size:17px;
+      font-weight:700;
+    }
+    .readiness-copy { min-width:0; }
+    .readiness-status { margin-top:5px; color:#b8f5ff; font-size:12px; font-weight:650; }
+    .readiness-missing { margin-top:4px; color:var(--muted); font-size:11px; }
+    .label { color:var(--muted); font-size:12px; }
+    .value { font-size:24px; font-weight:650; letter-spacing:-.03em; margin-top:8px; overflow-wrap:anywhere; }
+    .value.small { font-size:17px; }
+    .status-line { display:flex; align-items:center; gap:10px; }
+    .dot { width:10px; height:10px; border-radius:50%; background:var(--red); box-shadow:0 0 12px currentColor; color:var(--red); }
+    .dot.active { background:var(--green); color:var(--green); }
+    .dot.waiting { background:var(--yellow); color:var(--yellow); }
+    .error { color:var(--yellow); margin-top:6px; font-size:12px; }
+    .chips { display:flex; flex-wrap:wrap; gap:8px; }
+    .chip { border:1px solid #33425a; background:#1b2739; border-radius:999px; padding:5px 10px; font-size:12px; }
+    .profile { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:11px; }
+    .profile-item { border-radius:9px; background:var(--panel-soft); padding:10px; min-width:0; }
+    .profile-item b { display:block; margin-top:4px; overflow-wrap:anywhere; }
+    .param-grid { display:flex; flex-direction:column; gap:8px; margin-top:5px; }
+    .param-row { display:flex; justify-content:space-between; gap:12px; font-size:13px; border-bottom:1px solid rgba(255,255,255,.05); padding-bottom:4px; }
+    .param-label { color:#94a3b8; }
+    .param-value { color:#f8fafc; font-weight:600; font-family:monospace; text-align:right; overflow-wrap:anywhere; }
+    .table-wrap { overflow:auto; }
+    table { border-collapse:collapse; width:100%; min-width:520px; }
+    th,td { text-align:left; padding:9px 10px; border-bottom:1px solid var(--line); white-space:nowrap; }
+    th { color:var(--muted); font-size:11px; font-weight:550; text-transform:uppercase; letter-spacing:.06em; }
+    td { font-size:12px; }
+    .positive { color:var(--green); }
+    .negative { color:var(--red); }
+    .feed { height:340px; overflow:auto; display:flex; flex-direction:column; gap:8px; }
+    .event { background:var(--panel-soft); border:1px solid #202c3e; border-radius:8px; padding:9px 10px; overflow-wrap:anywhere; }
+    .event-meta { color:var(--muted); font:11px/1.4 Consolas, monospace; margin-bottom:3px; }
+    .event.ERROR .event-meta,.event.CRITICAL .event-meta { color:var(--red); }
+    .event.WARNING .event-meta { color:var(--yellow); }
+    .empty { color:var(--muted); padding:16px 4px; }
+    .jarvis {
+      position:relative;
+      display:grid;
+      grid-template-columns:150px minmax(0,1fr);
+      gap:22px;
+      align-items:center;
+      margin:0 0 14px;
+      padding:22px 24px;
+      overflow:hidden;
+      border:1px solid #286877;
+      border-radius:16px;
+      background:linear-gradient(115deg,rgba(13,37,52,.97),rgba(17,25,40,.98) 55%,rgba(15,35,48,.96));
+      box-shadow:inset 0 0 32px rgba(49,190,219,.07),0 0 24px rgba(39,180,210,.08);
+    }
+    .jarvis::after {
+      position:absolute;
+      inset:0;
+      pointer-events:none;
+      content:"";
+      background:repeating-linear-gradient(0deg,transparent 0 5px,rgba(101,211,232,.025) 6px);
+    }
+    .reactor-wrap { display:grid; place-items:center; min-height:128px; }
+    .reactor {
+      position:relative;
+      width:94px;
+      height:94px;
+      border:2px solid #72eaff;
+      border-radius:50%;
+      background:radial-gradient(circle,#efffff 0 5%,#68eaff 9%,#20849c 22%,#102b3c 48%,transparent 50%);
+      box-shadow:0 0 15px #59eaff,0 0 38px rgba(55,214,244,.65),inset 0 0 16px #59eaff;
+      animation:reactor-pulse 2.4s ease-in-out infinite;
+    }
+    .reactor::before,.reactor::after {
+      position:absolute;
+      inset:-12px;
+      border:1px solid rgba(105,231,255,.55);
+      border-radius:50%;
+      content:"";
+      animation:reactor-ring 6s linear infinite;
+    }
+    .reactor::after { inset:8px; border-style:dashed; animation-direction:reverse; animation-duration:11s; }
+    @keyframes reactor-pulse {
+      0%,100% { transform:scale(.97); filter:brightness(.85); }
+      50% { transform:scale(1.04); filter:brightness(1.2); }
+    }
+    @keyframes reactor-ring { to { transform:rotate(360deg); } }
+    .jarvis-content { min-width:0; position:relative; z-index:1; }
+    .jarvis-heading { display:flex; align-items:center; gap:10px; margin-bottom:5px; }
+    .jarvis-heading h2 { margin:0; color:#b8f5ff; font-size:17px; letter-spacing:.12em; text-transform:uppercase; }
+    .jarvis-state { color:#80e7f6; font:11px Consolas,monospace; letter-spacing:.12em; }
+    .jarvis-speech {
+      min-height:48px;
+      max-width:900px;
+      color:#e7f9ff;
+      font-size:15px;
+      line-height:1.6;
+      overflow-wrap:anywhere;
+    }
+    .jarvis-speech::after { content:""; display:inline-block; width:7px; height:1em; margin-left:3px; vertical-align:-2px; background:#71eaff; animation:cursor-blink 1s steps(2,start) infinite; }
+    @keyframes cursor-blink { to { visibility:hidden; } }
+    .jarvis-lines { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:8px 18px; margin-top:10px; color:#9db6c6; font-size:12px; }
+    .jarvis-lines span { min-width:0; }
+    .jarvis-bullets { margin:0; padding-left:18px; list-style:disc; }
+    .jarvis-bullets li { margin:2px 0; line-height:1.55; overflow-wrap:anywhere; }
+    .jarvis-bullets strong { color:#b8f5ff; }
+    .jarvis-candidates { display:flex; flex-wrap:wrap; gap:7px; margin-top:12px; }
+    .jarvis-candidate { border:1px solid #b88945; border-radius:999px; padding:4px 10px; color:#ffd58c; background:#332819; font-size:11px; }
+    .jarvis-tools { display:flex; flex-wrap:wrap; gap:8px; margin-top:14px; }
+    .jarvis-tools button,.jarvis-tools input {
+      min-height:34px;
+      border:1px solid #315267;
+      border-radius:7px;
+      color:#e6f8ff;
+      background:#101e2b;
+      font:12px "Segoe UI",system-ui,sans-serif;
+    }
+    .jarvis-tools button { padding:6px 11px; cursor:pointer; }
+    .jarvis-tools button:hover { border-color:#64dff3; background:#173144; }
+    .jarvis-tools input { flex:1 1 240px; padding:6px 10px; outline:none; }
+    .jarvis-tools input:focus { border-color:#64dff3; }
+    .jarvis-log { display:flex; flex-direction:column; gap:7px; max-height:220px; overflow:auto; margin-top:9px; }
+    .jarvis-log-entry { border-left:2px solid #38bdf8; padding:5px 8px; color:#cbd5e1; font-size:13px; overflow-wrap:anywhere; }
+    .jarvis-log-entry.user { border-color:#64748b; color:#d5deeb; }
+    .jarvis-log-entry.assistant { border-color:#38bdf8; color:#9de8ef; }
+    .jarvis-log-entry .jarvis-bullets { padding-left:18px; }
+    .thoughts-panel {
+      margin-bottom:14px;
+      border:1px solid #2b5066;
+      background:linear-gradient(145deg,#132233,#101925);
+      box-shadow:inset 0 0 30px rgba(62,171,210,.035);
+    }
+    .thought-tabs { display:flex; flex-wrap:wrap; gap:8px; margin:-3px 0 14px; }
+    .thought-tab {
+      padding:8px 12px;
+      border:1px solid #31445b;
+      border-radius:8px;
+      color:#aebed0;
+      background:#101725;
+      font:12px "Segoe UI",system-ui,sans-serif;
+      cursor:pointer;
+    }
+    .thought-tab[aria-selected="true"] {
+      border-color:#53d9ef;
+      color:#d5faff;
+      background:#143144;
+      box-shadow:0 0 14px rgba(83,217,239,.12);
+    }
+    .thought-content {
+      min-height:118px;
+      padding:18px;
+      border:1px solid #26384d;
+      border-radius:10px;
+      background:rgba(8,15,24,.6);
+      color:#d9e7f2;
+      font-size:14px;
+      line-height:1.75;
+      overflow-wrap:anywhere;
+    }
+    .thought-meta { margin-top:10px; color:var(--muted); font:11px Consolas,monospace; }
+    .thought-content .jarvis-bullets { padding-left:22px; }
+    @media(max-width:680px) {
+      .jarvis { grid-template-columns:1fr; gap:4px; padding:18px; }
+      .reactor-wrap { min-height:105px; }
+      .reactor { width:72px; height:72px; }
+      .jarvis-heading { justify-content:center; }
+      .jarvis-content { text-align:center; }
+      .jarvis-tools { justify-content:center; }
+    }
+    @media(prefers-reduced-motion:reduce) {
+      .reactor,.reactor::before,.reactor::after,.jarvis-speech::after { animation:none; }
+    }
+    @media(max-width:1100px) { .summary { grid-template-columns:repeat(3,minmax(0,1fr)); } }
+    @media(max-width:950px) { .three { grid-template-columns:1fr 1fr; } .three .panel:last-child { grid-column:1/-1; } }
+    @media(max-width:680px) { main { padding-top:18px; } header { align-items:flex-start; } .summary { grid-template-columns:1fr 1fr; } .two,.three { grid-template-columns:1fr; } .three .panel:last-child { grid-column:auto; } .card { min-height:90px; } .value { font-size:20px; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div><h1>ApexQuant <span style="color:#7cb4ff">Monitor</span> <span class="label">UNIFIED</span></h1><div class="sub">Local · read-only · Alpaca paper account · research is advisory</div></div>
+    <div class="refresh">Refreshes every 3 seconds<br><span id="updated">Connecting…</span></div>
+  </header>
+
+  <section class="jarvis" aria-labelledby="jarvis-title">
+    <div class="reactor-wrap" aria-hidden="true"><div class="reactor"></div></div>
+    <div class="jarvis-content">
+      <div class="jarvis-heading">
+        <h2 id="jarvis-title">Jarvis</h2>
+        <span id="jarvis-state" class="jarvis-state">INITIALIZING, SIR</span>
+      </div>
+      <div id="jarvis-speech" class="jarvis-speech" role="status" aria-live="polite">
+        Hello, Sir. Jarvis is connecting to your paper-trading monitor.
+      </div>
+      <div class="jarvis-lines">
+        <span id="jarvis-runner-line">Checking runner status, Sir.</span>
+        <span id="jarvis-candidate-line">Checking staged candidates, Sir.</span>
+        <span id="jarvis-strategy-line">Checking strategy status, Sir.</span>
+        <span id="jarvis-activity-line">Checking latest telemetry, Sir.</span>
+        <span id="jarvis-event-line">Checking system events, Sir.</span>
+        <span id="jarvis-account-line">Checking paper account status, Sir.</span>
+      </div>
+      <div id="jarvis-candidates" class="jarvis-candidates" aria-label="Staged candidates"></div>
+      <div class="jarvis-tools">
+        <button type="button" data-jarvis-question="runner">Runner status, Sir</button>
+        <button type="button" data-jarvis-question="candidates">Staged candidates, Sir</button>
+        <button type="button" data-jarvis-question="strategy">Strategy summary, Sir</button>
+        <form id="jarvis-form" style="display:contents">
+          <input id="jarvis-input" type="text" maxlength="240" autocomplete="off"
+            aria-label="Ask Jarvis a question, Sir"
+            placeholder="Ask Jarvis about system status, Sir">
+          <button type="submit">Ask Jarvis, Sir</button>
+        </form>
+      </div>
+      <div id="jarvis-log-container" class="jarvis-log" aria-live="polite"></div>
+    </div>
+  </section>
+
+  <section class="grid summary">
+    <article class="card">
+      <div class="label">AUTONOMOUS RUNNER</div>
+      <div class="status-line value small"><span id="status-dot" class="dot"></span><span id="runner-status">Loading</span></div>
+      <div id="runner-message" class="error"></div>
+      <div id="runner-telemetry" class="label" style="margin-top:7px"></div>
+    </article>
+    <article class="card"><div class="label">PAPER API</div><div id="api-status" class="value small">Checking</div><div id="api-error" class="error"></div></article>
+    <article class="card"><div class="label">ACCOUNT EQUITY</div><div id="equity" class="value">—</div><div class="label">USD</div></article>
+    <article class="card"><div class="label">CASH</div><div id="cash" class="value">—</div><div id="buying-power" class="label">Buying power —</div></article>
+    <article class="card readiness-card">
+      <div id="readiness-ring" class="readiness-ring" role="img" aria-label="Live readiness score unavailable">
+        <div class="readiness-ring-inner"><span id="readiness-score">0%</span></div>
+      </div>
+      <div class="readiness-copy">
+        <div class="label">LIVE READINESS</div>
+        <div id="readiness-status" class="readiness-status">UNSAFE</div>
+        <div id="readiness-missing" class="readiness-missing">Awaiting paper evidence</div>
+      </div>
+    </article>
+  </section>
+
+  <section class="panel thoughts-panel" aria-labelledby="thoughts-title">
+    <h2 id="thoughts-title">Jarvis Thoughts · live analysis, Sir</h2>
+    <div class="thought-tabs" role="tablist" aria-label="Jarvis analytical views, Sir">
+      <button class="thought-tab" id="thought-tab-operations" type="button" role="tab"
+        aria-selected="true" aria-controls="thought-operations" data-thought="operations">
+        Current Operations, Sir
+      </button>
+      <button class="thought-tab" id="thought-tab-why" type="button" role="tab"
+        aria-selected="false" aria-controls="thought-why" data-thought="why" tabindex="-1">
+        The Why, Sir
+      </button>
+      <button class="thought-tab" id="thought-tab-roadmap" type="button" role="tab"
+        aria-selected="false" aria-controls="thought-roadmap" data-thought="roadmap" tabindex="-1">
+        Future Roadmap &amp; Planning, Sir
+      </button>
+    </div>
+    <div id="thought-operations" class="thought-content" role="tabpanel"
+      aria-labelledby="thought-tab-operations">Jarvis is assembling current runner telemetry, Sir.</div>
+    <div id="thought-why" class="thought-content" role="tabpanel"
+      aria-labelledby="thought-tab-why" hidden></div>
+    <div id="thought-roadmap" class="thought-content" role="tabpanel"
+      aria-labelledby="thought-tab-roadmap" hidden></div>
+    <div id="thought-meta" class="thought-meta">Telemetry source: local heartbeat and strategy reports, Sir.</div>
+  </section>
+
+  <section class="grid two">
+    <article class="panel">
+      <h2>Strategy & daily profile</h2>
+      <div id="profile" class="profile"><div class="empty">No walk-forward profile available yet.</div></div>
+    </article>
+    <article class="panel">
+      <h2>Active universe</h2>
+      <div id="universe" class="chips"><span class="empty">Waiting for runner heartbeat.</span></div>
+      <div id="profile-date" class="label" style="margin-top:14px"></div>
+    </article>
+  </section>
+
+  <section class="grid three">
+    <article class="panel">
+      <h2>Open positions</h2>
+      <div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Qty / side</th><th>Market value</th><th>Unrealized P&amp;L</th></tr></thead><tbody id="positions"></tbody></table></div>
+    </article>
+    <article class="panel">
+      <h2>Recent orders</h2>
+      <div class="table-wrap"><table><thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Status</th></tr></thead><tbody id="orders"></tbody></table></div>
+    </article>
+    <article class="panel">
+      <h2>AI brain at work · live activity</h2>
+      <div id="activity" class="feed"><div class="empty">No log entries yet.</div></div>
+    </article>
+  </section>
+  <section class="grid two">
+    <article class="panel">
+      <h2>Market regimes</h2>
+      <div id="regimes" class="chips"><span class="empty">Waiting for research cycle.</span></div>
+      <div id="research-note" class="label" style="margin-top:14px"></div>
+    </article>
+    <article class="panel">
+      <h2>Strategy arsenal · paper gates</h2>
+      <div id="arsenal" class="profile"><div class="empty">Arsenal is not initialized yet.</div></div>
+    </article>
+  </section>
+  <section class="grid two">
+    <article class="panel">
+      <h2>Candidate audit · human review gate</h2>
+      <div id="candidate-audit" class="profile"><div class="empty">No candidate audit available.</div></div>
+    </article>
+    <article class="panel">
+      <h2>Holdout & transaction costs</h2>
+      <div id="holdout-audit" class="profile"><div class="empty">No validation report available.</div></div>
+    </article>
+  </section>
+</main>
+<script>
+  const byId = (id) => document.getElementById(id);
+  const money = (value) => {
+    const number = Number(value);
+    return Number.isFinite(number) ? number.toLocaleString(undefined, {style:"currency",currency:"USD"}) : "—";
+  };
+  const metric = (value, digits, suffix = "") => {
+    const number = Number(value);
+    return value == null || !Number.isFinite(number) ? "n/a" : `${number.toFixed(digits)}${suffix}`;
+  };
+  const text = (node, value) => {
+    const next = value == null ? "" : String(value);
+    if (node.textContent !== next) node.textContent = next;
+  };
+  function combineJarvisBullets(...parts) {
+    const lines = parts.flatMap((part) => String(part || "").split(/\r?\n/))
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith("• "));
+    return Array.from(new Set(lines)).slice(0, 4).join("\n")
+      || "• **Status:** System telemetry is unavailable. Sir.";
+  }
+  function renderBullets(node, value) {
+    const source = String(value || "");
+    if (node.dataset.jarvisSource === source) return;
+    node.dataset.jarvisSource = source;
+    const list = document.createElement("ul");
+    list.className = "jarvis-bullets";
+    for (const rawLine of source.split(/\r?\n/).filter(Boolean).slice(0, 4)) {
+      const item = document.createElement("li");
+      const match = rawLine.match(/^\s*•\s*\*\*(.+?):\*\*\s*(.*)$/);
+      if (match) {
+        const lead = document.createElement("strong");
+        text(lead, `${match[1]}: `);
+        item.append(lead, document.createTextNode(match[2]));
+      } else {
+        text(item, rawLine.replace(/^\s*•\s*/, ""));
+      }
+      list.appendChild(item);
+    }
+    node.replaceChildren(list);
+  }
+  let jarvisTarget = "";
+  let jarvisTypingTimer = null;
+  let jarvisInteractionUntil = 0;
+  function speakJarvis(message) {
+    const output = byId("jarvis-speech");
+    const source = String(message || "• **Jarvis:** Standing by. Sir.");
+    const target = source
+      .replace(/^\s*•\s*/gm, "")
+      .replace(/\*\*(.+?):\*\*/g, "$1:")
+      .replace(/\s*Sir\./g, "");
+    if (target === jarvisTarget) return;
+    jarvisTarget = target;
+    if (jarvisTypingTimer !== null) clearInterval(jarvisTypingTimer);
+    output.textContent = "";
+    let index = 0;
+    jarvisTypingTimer = setInterval(() => {
+      output.textContent = target.slice(0, ++index);
+      if (index >= target.length) {
+        clearInterval(jarvisTypingTimer);
+        jarvisTypingTimer = null;
+        renderBullets(output, source);
+      }
+    }, 18);
+  }
+  function cell(row, value, className) {
+    const td = document.createElement("td");
+    text(td, value);
+    if (className) td.className = className;
+    row.appendChild(td);
+  }
+  function emptyRow(body, columns, message) {
+    const row = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = columns;
+    td.className = "muted";
+    text(td, message);
+    row.appendChild(td);
+    body.replaceChildren(row);
+  }
+  function renderOptimizedParameters(params) {
+    const container = document.createElement("div");
+    const entries = params && typeof params === "object" && !Array.isArray(params)
+      ? Object.entries(params)
+      : [];
+    if (!entries.length) {
+      container.className = "empty";
+      text(container, "No active parameters, Sir.");
+      return container;
+    }
+
+    const labels = {
+      min_signal_score: "Min Signal Score",
+      atr_stop_mult: "ATR Stop Mult",
+      min_reward_risk: "Min Reward/Risk",
+      chandelier_atr_mult: "Chandelier ATR",
+    };
+    container.className = "param-grid";
+    for (const [key, value] of entries) {
+      const row = document.createElement("div");
+      row.className = "param-row";
+      const title = document.createElement("span");
+      title.className = "param-label";
+      text(title, labels[key] || key);
+      const displayValue = typeof value === "number"
+        ? `${value}${key.includes("mult") || key.includes("risk") ? "x" : ""}`
+        : value == null ? "—" : String(value);
+      const detail = document.createElement("span");
+      detail.className = "param-value";
+      text(detail, displayValue);
+      row.append(title, detail);
+      container.appendChild(row);
+    }
+    return container;
+  }
+  function renderProfile(profile) {
+    const host = byId("profile");
+    host.replaceChildren();
+    if (!profile) {
+      host.innerHTML = '<div class="empty">No walk-forward profile available yet.</div>';
+      text(byId("profile-date"), "");
+      return;
+    }
+    const values = [
+      ["Training window", profile.train || "—"],
+      ["Out-of-sample window", profile.test || "—"],
+      ["OOS expectancy", profile.test_mean_r == null ? "—" : `${Number(profile.test_mean_r).toFixed(3)}R`],
+      ["OOS win rate", profile.test_win_rate == null ? "—" : `${(Number(profile.test_win_rate) * 100).toFixed(1)}%`],
+      ["OOS profit factor", profile.test_profit_factor == null ? "—" : Number(profile.test_profit_factor).toFixed(2)],
+    ];
+    const parameterItem = document.createElement("div");
+    parameterItem.className = "profile-item";
+    const parameterTitle = document.createElement("span");
+    parameterTitle.className = "label";
+    text(parameterTitle, "Optimized parameters");
+    parameterItem.append(parameterTitle, renderOptimizedParameters(profile.params));
+    host.appendChild(parameterItem);
+    for (const [label, value] of values) {
+      const item = document.createElement("div");
+      item.className = "profile-item";
+      const title = document.createElement("span");
+      title.className = "label";
+      text(title, label);
+      const detail = document.createElement("b");
+      text(detail, value);
+      item.append(title, detail);
+      host.appendChild(item);
+    }
+    text(byId("profile-date"), profile.as_of ? `Profile generated ${profile.as_of}` : "");
+  }
+  function renderResearch(research) {
+    const host = byId("regimes");
+    host.replaceChildren();
+    const regimes = research && research.regimes ? research.regimes : {};
+    const entries = Object.entries(regimes);
+    if (!entries.length) {
+      const empty = document.createElement("span");
+      empty.className = "empty";
+      text(empty, "Waiting for research cycle.");
+      host.appendChild(empty);
+    } else {
+      for (const [symbol, regime] of entries) {
+        const chip = document.createElement("span");
+        chip.className = "chip";
+        const adx = Number(regime.adx);
+        const label = String(regime.label || "unknown").replaceAll("_", " ");
+        const context = research.timeframe_context && research.timeframe_context[symbol] || {};
+        const hourly = context["1h"] || {};
+        const daily = context["1d"] || {};
+        const alignment = (value) => value === true ? "aligned" : value === false ? "not aligned" : "warming";
+        text(chip, `${symbol} · ${label} · 1h ${alignment(hourly.bullish_alignment)} · 1d ${alignment(daily.bullish_alignment)} · ADX ${Number.isFinite(adx) ? adx.toFixed(1) : "—"}`);
+        host.appendChild(chip);
+      }
+    }
+    text(byId("research-note"), research ? research.note || `Updated ${research.updated_at || ""}` : "");
+  }
+  function renderArsenal(arsenal) {
+    const host = byId("arsenal");
+    host.replaceChildren();
+    const strategies = arsenal && Array.isArray(arsenal.strategies) ? arsenal.strategies : [];
+    if (!strategies.length) {
+      const empty = document.createElement("div");
+      empty.className = "empty";
+      text(empty, "Arsenal is not initialized yet.");
+      host.appendChild(empty);
+      return;
+    }
+    for (const strategy of strategies) {
+      const item = document.createElement("div");
+      item.className = "profile-item";
+      const title = document.createElement("span");
+      title.className = "label";
+      text(title, strategy.name || strategy.id || "Strategy");
+      const status = document.createElement("b");
+      text(status, `${strategy.status || "research_only"} · ${strategy.paper_trades || 0} paper trades`);
+      item.append(title, status);
+      host.appendChild(item);
+    }
+  }
+  function renderAudit(audit) {
+    const candidate = byId("candidate-audit");
+    const holdout = byId("holdout-audit");
+    candidate.replaceChildren();
+    holdout.replaceChildren();
+    if (!audit) {
+      for (const host of [candidate, holdout]) {
+        const empty = document.createElement("div");
+        empty.className = "empty";
+        text(empty, "No candidate audit available, Sir.");
+        host.appendChild(empty);
+      }
+      return;
+    }
+    const auditRows = [
+      ["Candidate", audit.candidate_id || "—"],
+      ["Status", audit.status || "unknown"],
+      ["Variants tested", audit.n_trials ?? "—"],
+      ["Raw Sharpe", metric(audit.raw_sharpe, 2)],
+      ["Deflated Sharpe confidence", metric(audit.deflated_sharpe_probability, 3)],
+      ["Required Sharpe", metric(audit.required_sharpe, 2)],
+      ["Human approval", audit.status === "staged_candidate" ? "Required before use" : "Not staged"],
+    ];
+    const holdoutData = audit.holdout || {};
+    const holdoutMetrics = holdoutData.metrics || {};
+    const costRows = [
+      ["Final holdout", holdoutData.passed ? "PASSED" : (holdoutData.reason || "Not available")],
+      ["Holdout trades", holdoutMetrics.n ?? "—"],
+      ["Holdout profit factor", metric(holdoutMetrics.profit_factor, 2)],
+      ["Expected slippage drag", money(audit.expected_slippage_drag)],
+      ["Simulated slippage drag", money(audit.simulated_slippage_drag)],
+      ["All simulated transaction costs", money(audit.simulated_transaction_costs)],
+      ["Forward paper expectancy", metric(audit.forward_paper_expectancy_r, 3, "R")],
+    ];
+    for (const [host, rows] of [[candidate, auditRows], [holdout, costRows]]) {
+      for (const [label, value] of rows) {
+        const item = document.createElement("div");
+        item.className = "profile-item";
+        const title = document.createElement("span");
+        title.className = "label";
+        text(title, label);
+        const detail = document.createElement("b");
+        text(detail, value);
+        item.append(title, detail);
+        host.appendChild(item);
+      }
+    }
+  }
+  function renderJarvis(data) {
+    const jarvis = data.jarvis || {};
+    const runner = data.runner || {};
+    const candidates = Array.isArray(data.staged_candidates) ? data.staged_candidates : [];
+    const stateLabel = runner.status === "active"
+      ? "PAPER RUNNER ACTIVE, SIR"
+      : runner.status === "waiting"
+        ? "WAITING FOR MARKET HOURS, SIR"
+        : "RUNNER DISCONNECTED, SIR";
+    text(byId("jarvis-state"), stateLabel);
+    if (Date.now() >= jarvisInteractionUntil) {
+      speakJarvis(combineJarvisBullets(jarvis.greeting, jarvis.status));
+    }
+    renderBullets(byId("jarvis-runner-line"), jarvis.status);
+    renderBullets(byId("jarvis-candidate-line"), jarvis.candidates);
+    renderBullets(byId("jarvis-strategy-line"), combineJarvisBullets(jarvis.strategies, jarvis.regimes));
+    renderBullets(byId("jarvis-activity-line"), jarvis.activity);
+    renderBullets(byId("jarvis-event-line"), jarvis.system_event);
+    renderBullets(byId("jarvis-account-line"), jarvis.account);
+    const host = byId("jarvis-candidates");
+    const candidateLabels = candidates.length
+      ? candidates.map((candidate) => `${candidate.candidate_id} · awaiting your review, Sir`)
+      : ["No staged candidates, Sir"];
+    const currentLabels = Array.from(host.children, (node) => node.textContent);
+    if (JSON.stringify(candidateLabels) !== JSON.stringify(currentLabels)) {
+      host.replaceChildren();
+      if (!candidates.length) {
+        const chip = document.createElement("span");
+        chip.className = "jarvis-candidate";
+        text(chip, candidateLabels[0]);
+        host.appendChild(chip);
+      } else {
+        for (const label of candidateLabels) {
+          const chip = document.createElement("span");
+          chip.className = "jarvis-candidate";
+          text(chip, label);
+          host.appendChild(chip);
+        }
+      }
+    }
+  }
+  async function askJarvis(promptText) {
+    let response;
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), 100000);
+    try {
+      response = await fetch("/api/jarvis", {
+        method: "POST",
+        cache: "no-store",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({prompt: promptText}),
+        signal: controller.signal,
+      });
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        throw new Error("Jarvis timed out waiting for Ollama. Try again after the model is ready.");
+      }
+      throw new Error("Cannot reach the dashboard API. Open this page from the local dashboard server.");
+    } finally {
+      window.clearTimeout(timeoutId);
+    }
+
+    let payload;
+    try {
+      payload = await response.json();
+    } catch (error) {
+      throw new Error(`Dashboard API returned invalid JSON (HTTP ${response.status}).`);
+    }
+    if (!response.ok) {
+      const errorMessage = payload && typeof payload === "object"
+        ? payload.reply || payload.answer || payload.error
+        : "";
+      throw new Error(errorMessage || `Jarvis request failed with HTTP ${response.status}`);
+    }
+    const reply = payload && typeof payload === "object"
+      ? payload.reply || payload.answer
+      : "";
+    if (typeof reply !== "string" || !reply.trim()) {
+      throw new Error("Dashboard API returned no Jarvis reply.");
+    }
+    return reply;
+  }
+  function appendJarvisLog(message, speaker = "assistant") {
+    const logContainer = byId("jarvis-log-container");
+    const entry = document.createElement("div");
+    entry.className = `jarvis-log-entry ${speaker}`;
+    if (speaker === "assistant") {
+      renderBullets(entry, message);
+    } else {
+      text(entry, message);
+    }
+    logContainer.prepend(entry);
+    while (logContainer.children.length > 12) {
+      logContainer.lastElementChild.remove();
+    }
+    return entry;
+  }
+  async function submitJarvisQuestion(question) {
+    jarvisInteractionUntil = Date.now() + 100000;
+    appendJarvisLog(`You: ${question}`, "user");
+    const responseEntry = appendJarvisLog("• **Jarvis:** Preparing a concise answer, Sir.");
+    let reply;
+    try {
+      reply = await askJarvis(question);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "The request failed.";
+      const message = `• **Jarvis:** ${reason} Sir.`;
+      renderBullets(responseEntry, message);
+      jarvisInteractionUntil = Date.now() + 15000;
+      speakJarvis(message);
+      return;
+    }
+    renderBullets(responseEntry, reply);
+    jarvisInteractionUntil = Date.now() + 15000;
+    speakJarvis(reply);
+  }
+  function renderThoughts(data) {
+    const thoughts = (data.jarvis && data.jarvis.thoughts) || {};
+    renderBullets(byId("thought-operations"),
+      thoughts.operations || "No operation telemetry was reported; verify the runner heartbeat, Sir.");
+    renderBullets(byId("thought-why"),
+      thoughts.why || "No audit or research inputs are available to explain a candidate decision, Sir.");
+    renderBullets(byId("thought-roadmap"),
+      thoughts.roadmap || "No planning inputs are available; review runner health and the local macro calendar, Sir.");
+    const heartbeat = data.runner && data.runner.timestamp;
+    const trialCount = data.trial_ledger && data.trial_ledger.total_trials;
+    const timestamp = heartbeat
+      ? new Date(typeof heartbeat === "number" ? heartbeat * 1000 : heartbeat).toLocaleString()
+      : "not recorded";
+    text(byId("thought-meta"),
+      `Passive local telemetry · heartbeat ${timestamp} · ${trialCount ?? 0} strategy trials · read-only, Sir.`);
+  }
+  function renderPositions(positions) {
+    const body = byId("positions");
+    body.replaceChildren();
+    if (!positions || positions.length === 0) return emptyRow(body, 4, "No open positions");
+    for (const position of positions) {
+      const row = document.createElement("tr");
+      const pnl = Number(position.unrealized_pl);
+      cell(row, position.symbol);
+      cell(row, `${position.qty} / ${position.side}`);
+      cell(row, money(position.market_value));
+      cell(row, money(position.unrealized_pl), pnl >= 0 ? "positive" : "negative");
+      body.appendChild(row);
+    }
+  }
+  function renderOrders(orders) {
+    const body = byId("orders");
+    body.replaceChildren();
+    if (!orders || orders.length === 0) return emptyRow(body, 5, "No recent orders");
+    for (const order of orders) {
+      const row = document.createElement("tr");
+      const submitted = order.submitted_at ? new Date(order.submitted_at).toLocaleTimeString() : "—";
+      cell(row, submitted);
+      cell(row, order.symbol);
+      cell(row, order.side);
+      cell(row, order.filled_qty || order.qty);
+      cell(row, order.status);
+      body.appendChild(row);
+    }
+  }
+  function renderActivity(events) {
+    const host = byId("activity");
+    host.replaceChildren();
+    if (!events || events.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "empty";
+      text(empty, "No activity log found yet.");
+      host.appendChild(empty);
+      return;
+    }
+    for (const event of events) {
+      const item = document.createElement("div");
+      item.className = `event ${event.level || "INFO"}`;
+      const meta = document.createElement("div");
+      meta.className = "event-meta";
+      text(meta, `${event.timestamp || ""} ${event.level || ""}`);
+      const message = document.createElement("div");
+      text(message, event.message);
+      item.append(meta, message);
+      host.appendChild(item);
+    }
+    host.scrollTop = 0;
+  }
+  function render(data) {
+    const runner = data.runner || {};
+    const runnerStatus = runner.status || "disconnected";
+    const statusLabel = runnerStatus === "waiting"
+      ? "RUNNING · MARKET CLOSED"
+      : runnerStatus.toUpperCase();
+    text(byId("runner-status"), statusLabel);
+    text(byId("runner-message"), runner.message || "");
+    const telemetry = runner.telemetry;
+    const scanSummary = telemetry && telemetry.symbol
+      ? [
+          `${telemetry.symbol} ${telemetry.phase || ""}`,
+          `RVOL ${metric(telemetry.rvol, 2, "x")}`,
+          `ADX ${metric(telemetry.adx, 1)}`,
+          `ATR ${metric(telemetry.atr, 4)}`,
+          `Score ${metric(telemetry.score, 2)}`,
+          `R:R ${metric(telemetry.reward_risk, 2)}:1`,
+          telemetry.mtf ? `MTF ${telemetry.mtf.allowed ? "aligned" : "blocked"} · ${telemetry.mtf.reason || ""}` : "",
+          telemetry.accepted ? "ELIGIBLE" : telemetry.reason || "REJECTED",
+        ].filter(Boolean).join(" · ")
+      : telemetry && telemetry.event === "daily_drawdown_halt"
+        ? `Circuit breaker · drawdown ${metric(telemetry.drawdown_pct, 2, "%")} · equity ${money(telemetry.equity)}`
+        : telemetry && telemetry.event === "macro_circuit_breaker"
+          ? `Macro circuit breaker · ${telemetry.reason || "new entries paused"} · until ${telemetry.until || "event clear"}`
+        : "";
+    text(byId("runner-telemetry"), scanSummary);
+    byId("status-dot").className = `dot ${runnerStatus}`;
+    const account = data.account || {};
+    text(byId("api-status"), account.connected ? "CONNECTED" : "DISCONNECTED");
+    text(byId("api-error"), account.error ? account.error.message : "");
+    const financials = account.data || {};
+    text(byId("equity"), money(financials.equity));
+    text(byId("cash"), money(financials.cash));
+    text(byId("buying-power"), `Buying power ${money(financials.buying_power)}`);
+    const readinessScore = Number(data.readiness_score);
+    const safeReadinessScore = Number.isFinite(readinessScore)
+      ? Math.max(0, Math.min(100, Math.round(readinessScore)))
+      : 0;
+    const readinessBreakdown = data.readiness_breakdown || {};
+    const missingCriteria = Array.isArray(readinessBreakdown.missing_criteria)
+      ? readinessBreakdown.missing_criteria
+      : [];
+    const readinessRing = byId("readiness-ring");
+    readinessRing.style.setProperty("--readiness-progress", `${safeReadinessScore}%`);
+    readinessRing.setAttribute(
+      "aria-label",
+      `Paper-only readiness score ${safeReadinessScore} percent · ${data.readiness_status || "UNSAFE"}`,
+    );
+    readinessRing.title = [
+      ...(missingCriteria.length ? missingCriteria : ["All measured criteria clear."]),
+      readinessBreakdown.paper_only_notice || "Informational only; live orders remain disabled.",
+    ].join("\n");
+    text(byId("readiness-score"), `${safeReadinessScore}%`);
+    text(byId("readiness-status"), data.readiness_status || "UNSAFE");
+    text(
+      byId("readiness-missing"),
+      missingCriteria.length
+        ? `${missingCriteria.length} criteria · paper only`
+        : "Measured criteria clear · paper only",
+    );
+    renderProfile(data.profile);
+    renderResearch(data.research);
+    renderArsenal(data.arsenal);
+    renderAudit(data.audit);
+    renderJarvis(data);
+    renderThoughts(data);
+    const universe = byId("universe");
+    universe.replaceChildren();
+    const symbols = data.symbols || [];
+    if (!symbols.length) {
+      const empty = document.createElement("span");
+      empty.className = "empty";
+      text(empty, "Universe not reported yet.");
+      universe.appendChild(empty);
+    } else {
+      for (const symbol of symbols) {
+        const chip = document.createElement("span");
+        chip.className = "chip";
+        text(chip, symbol);
+        universe.appendChild(chip);
+      }
+      document.querySelectorAll("[data-thought]").forEach((tab) => {
+        tab.addEventListener("click", () => {
+          document.querySelectorAll("[data-thought]").forEach((item) => {
+            const selected = item === tab;
+            item.setAttribute("aria-selected", String(selected));
+            item.tabIndex = selected ? 0 : -1;
+            const panel = byId(`thought-${item.dataset.thought}`);
+            panel.hidden = !selected;
+          });
+        });
+        tab.addEventListener("keydown", (event) => {
+          if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+          event.preventDefault();
+          const tabs = Array.from(document.querySelectorAll("[data-thought]"));
+          const index = tabs.indexOf(tab);
+          const offset = event.key === "ArrowRight" ? 1 : -1;
+          tabs[(index + offset + tabs.length) % tabs.length].click();
+          tabs[(index + offset + tabs.length) % tabs.length].focus();
+        });
+      });
+    }
+    renderPositions(data.positions);
+    renderOrders(data.orders);
+    renderActivity(data.activity);
+    text(byId("updated"), `Updated ${new Date(data.updated_at).toLocaleTimeString()}`);
+  }
+  byId("jarvis-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const input = byId("jarvis-input");
+    const question = input.value.trim();
+    if (!question) return;
+    input.value = "";
+    await submitJarvisQuestion(question);
+  });
+  document.querySelectorAll("[data-jarvis-question]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      await submitJarvisQuestion(button.dataset.jarvisQuestion);
+    });
+  });
+  async function refresh() {
+    try {
+      const response = await fetch("/api/state", {cache:"no-store"});
+      if (!response.ok) throw new Error(`Dashboard API returned HTTP ${response.status}`);
+      const data = await response.json();
+      window.apexQuantState = data;
+      render(data);
+    } catch (error) {
+      text(byId("api-status"), "DASHBOARD ERROR");
+      text(byId("api-error"), error.message);
+    }
+  }
+  refresh();
+  setInterval(refresh, 3000);
+</script>
+</body>
+</html>

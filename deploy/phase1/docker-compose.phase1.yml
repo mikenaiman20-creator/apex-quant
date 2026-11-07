@@ -1,0 +1,39 @@
+services:
+  streamlit:
+    environment:
+      APEX_SOURCE_ROOT: /app/source
+    volumes:
+      - /home/ubuntu/apex_quant/backtest:/app/source/backtest:ro
+      - /home/ubuntu/apex_quant/config:/app/source/config:ro
+      - /home/ubuntu/apex_quant/engine:/app/source/engine:ro
+      - /home/ubuntu/apex_quant/server:/app/source/server:ro
+
+  nginx:
+    volumes:
+      - ../phase1/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+      - /home/ubuntu/apex_quant/.certbot-webroot:/var/www/certbot:ro
+
+  certbot:
+    profiles:
+      - certbot
+    image: ${CERTBOT_IMAGE:?Set CERTBOT_IMAGE to a verified, digest-pinned image}
+    entrypoint:
+      - certbot
+    command:
+      - certonly
+      - --webroot
+      - --webroot-path
+      - /var/www/certbot
+      - --email
+      - ${CERTBOT_EMAIL:?Set CERTBOT_EMAIL}
+      - --agree-tos
+      - --no-eff-email
+      - --non-interactive
+      - -d
+      - ${DASHBOARD_DOMAIN:?Set DASHBOARD_DOMAIN}
+    volumes:
+      - /etc/letsencrypt:/etc/letsencrypt
+      - /home/ubuntu/apex_quant/.certbot-webroot:/var/www/certbot
+    networks:
+      - egress
