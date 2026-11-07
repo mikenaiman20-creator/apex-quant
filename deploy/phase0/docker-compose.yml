@@ -113,7 +113,7 @@ services:
 networks:
   apex-internal:
     name: apex-internal
-    internal: true
+    external: true
   chroma-isolated:
     name: apex-chroma-isolated
     internal: true

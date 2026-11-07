@@ -83,6 +83,9 @@ Allow TCP/80 and TCP/443 in OCI ingress as needed. Keep TCP/22 restricted to the
 
 ```bash
 cd /home/ubuntu/apex_quant
+docker network inspect apex-internal >/dev/null 2>&1 || \
+  docker network create --internal apex-internal
+test "$(docker network inspect apex-internal --format '{{.Internal}}')" = true
 docker compose --env-file deploy/phase0/deployment.env \
   -f deploy/phase0/docker-compose.yml config
 docker compose --env-file deploy/phase0/deployment.env \
