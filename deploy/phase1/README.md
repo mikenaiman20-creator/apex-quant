@@ -24,11 +24,16 @@ manifest digest:
 DASHBOARD_DOMAIN=151.145.93.209.nip.io
 CERTBOT_EMAIL=mikenaiman20@gmail.com
 CERTBOT_IMAGE=certbot/certbot@sha256:<verified-arm64-manifest-digest>
+APEX_RUNTIME_UID=1001
+APEX_RUNTIME_GID=1001
 ```
 
 The digest must identify an official Certbot image manifest that supports the OCI ARM64
 architecture. Keep `deployment.env` mode `600`. Existing verified Nginx, OAuth2 Proxy, Python,
 and Chroma image digests remain in that same file.
+The Streamlit container runs as this unprivileged host UID/GID so it can read the mode-`700`
+production data and log directories without making those files world-readable. Verify the values
+against `id -u ubuntu` and `id -g ubuntu` before starting the stack.
 
 Resolve the hostname on the OCI host and confirm it returns `151.145.93.209`:
 

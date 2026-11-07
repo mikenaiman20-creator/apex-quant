@@ -1,5 +1,6 @@
 services:
   streamlit:
+    user: "${APEX_RUNTIME_UID:?Set APEX_RUNTIME_UID}:${APEX_RUNTIME_GID:?Set APEX_RUNTIME_GID}"
     environment:
       APEX_SOURCE_ROOT: /app/source
     volumes:
