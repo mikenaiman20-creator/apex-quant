@@ -15,6 +15,8 @@ import streamlit as st
 ROOT = Path(os.environ.get("APEX_DATA_ROOT", "/app"))
 LOGS = ROOT / "logs"
 DATA = ROOT / "data"
+SOURCE_ROOT = Path(os.environ.get("APEX_SOURCE_ROOT", "/app/source"))
+SOURCE_MODULES = ("backtest", "config", "engine", "server")
 
 
 def _read_json(path: Path) -> tuple[dict[str, Any] | None, str | None]:
@@ -281,6 +283,24 @@ def _render_dashboard() -> None:
         st.info(
             "The dashboard receives no broker credentials and cannot submit or modify orders. "
             "Displayed account state is published by the paper runner."
+        )
+        st.subheader("Deployment health")
+        module_health = [
+            {"module": name, "mounted": (SOURCE_ROOT / name).is_dir()}
+            for name in SOURCE_MODULES
+        ]
+        _table(module_health, ("module", "mounted"))
+        if not all(item["mounted"] for item in module_health):
+            st.warning(
+                f"One or more project modules are missing from {SOURCE_ROOT}. "
+                "Check the read-only Phase 1 source mounts."
+            )
+        snapshot_status = str((paper or {}).get("paper_api_status", "unavailable"))
+        st.write(
+            "Paper API snapshot:",
+            snapshot_status,
+            "· timestamp:",
+            (paper or {}).get("timestamp", "not available"),
         )
 
     with tabs[1]:

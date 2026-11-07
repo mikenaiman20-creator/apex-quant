@@ -14,6 +14,7 @@ def _app_test(path: Path):
 def test_streamlit_dashboard_shows_sections_even_without_telemetry(monkeypatch):
     root = Path(__file__).parents[1]
     monkeypatch.setenv("APEX_DATA_ROOT", str(root / "missing-production-data"))
+    monkeypatch.setenv("APEX_SOURCE_ROOT", str(root / "missing-production-source"))
     app = _app_test(root / "app.py")
 
     assert not app.exception
@@ -22,14 +23,21 @@ def test_streamlit_dashboard_shows_sections_even_without_telemetry(monkeypatch):
         "Overview", "Trading", "Research", "Strategy validation", "Activity",
     }
     assert any("Production telemetry is not mounted" in item.value for item in app.error)
+    assert any(
+        item.value.startswith("One or more project modules are missing")
+        for item in app.warning
+    )
 
 
 def test_streamlit_dashboard_renders_published_paper_research_data(monkeypatch, tmp_path):
     root = tmp_path
     logs = root / "logs"
     data = root / "data"
+    source = root / "source"
     logs.mkdir()
     data.mkdir()
+    for module in ("backtest", "config", "engine", "server"):
+        (source / module).mkdir(parents=True)
     (logs / "runner_heartbeat.json").write_text(json.dumps({
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "status": "active",
@@ -111,6 +119,7 @@ def test_streamlit_dashboard_renders_published_paper_research_data(monkeypatch, 
     connection.close()
 
     monkeypatch.setenv("APEX_DATA_ROOT", str(root))
+    monkeypatch.setenv("APEX_SOURCE_ROOT", str(source))
     app = _app_test(Path(__file__).parents[1] / "app.py")
 
     assert not app.exception
@@ -121,3 +130,7 @@ def test_streamlit_dashboard_renders_published_paper_research_data(monkeypatch, 
         for item in app.metric
     )
     assert any(item.label == "SQLite integrity" and item.value == "OK" for item in app.metric)
+    assert not any(
+        item.value.startswith("One or more project modules are missing")
+        for item in app.warning
+    )
