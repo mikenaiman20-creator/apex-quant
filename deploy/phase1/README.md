@@ -13,7 +13,7 @@ host. Never run `docker compose down --volumes` for this stack.
 
 ## 1. Prepare Phase 1 values and network
 
-Copy this directory and the updated `app.py` and `server/autonomous_runner.py` to
+Copy this directory and the updated `app.py` and `server/paper_snapshot.py` to
 `/home/ubuntu/apex_quant`. Keep the running production `data/` and `logs/` directories intact.
 Use Compose project name `apex-project` for every command below; it preserves the existing
 `apex-project_chroma_data` named volume across the deployment.
@@ -159,31 +159,41 @@ Chroma remains on its own internal-only network and has no published host port. 
 Python backend described by CVE-2026-45829, or that the exact image is vendor-fixed. Isolation is
 not a software patch. Do not attach other services to its network or add a `ports:` mapping.
 
-## 6. Deploy the quantitative modules and verify telemetry
+## 6. Deploy sanitized PAPER telemetry
 
-Copy the updated `app.py` and `server/autonomous_runner.py` into the project directory. Streamlit
-reloads the read-only bind-mounted app script. Restart the actual autonomous runner service so it
-loads the sanitized PAPER snapshot writer; do not restart `apex_quant.service` unless you intend to
-run its separate oneshot backtest job. Identify the runner unit first:
+The paper snapshot service makes only GET requests to the Alpaca PAPER API. It refuses to run
+unless `TRADING_MODE=PAPER` and `BROKER=ALPACA`, publishes an allowlisted snapshot to `logs/`,
+and never gives broker credentials to Streamlit. It is not a trading runner and cannot place,
+replace, or cancel orders.
+
+Install the service and its once-per-minute timer:
 
 ```bash
-systemctl list-units --type=service --all --no-pager | grep -Ei 'apex|runner|unified|trading'
+sudo install -o root -g root -m 644 \
+  deploy/phase1/apex-paper-snapshot.service /etc/systemd/system/
+sudo install -o root -g root -m 644 \
+  deploy/phase1/apex-paper-snapshot.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl start apex-paper-snapshot.service
+sudo systemctl enable --now apex-paper-snapshot.timer
+sudo systemctl --no-pager status apex-paper-snapshot.service
+sudo systemctl list-timers apex-paper-snapshot.timer --no-pager
 ```
 
-After restarting the runner unit, verify:
+Verify the sanitized publication and local database integrity:
 
 ```bash
 python3 -c "import json,pathlib; p=pathlib.Path('logs/paper_dashboard_snapshot.json'); d=json.loads(p.read_text()); print(d['timestamp'], d['paper_api_status'], d['mode'], len(d['positions']), len(d['orders']))"
-sqlite3 -readonly data/knowledge_brain.sqlite 'PRAGMA quick_check;'
+python3 -c "import sqlite3; c=sqlite3.connect('file:data/knowledge_brain.sqlite?mode=ro',uri=True); print(c.execute('PRAGMA quick_check').fetchone()[0]); c.close()"
 docker compose -p apex-project --env-file deploy/phase0/deployment.env \
   -f deploy/phase0/docker-compose.yml \
   -f deploy/phase1/docker-compose.phase1.yml \
   exec -T streamlit python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health').read().decode())"
 ```
 
-The dashboard's Research tab also reports SQLite integrity and strategy/source counts. API
-connectivity is current only when `paper_api_status` is `connected` and the snapshot timestamp is
-recent; a stale snapshot is explicitly flagged.
+The Research tab reads the SQLite database read-only and displays strategy/source counts. The
+Trading tab reports account and order state only from the sanitized snapshot; stale data is
+explicitly flagged.
 
 ## 7. Acceptance checks
 
