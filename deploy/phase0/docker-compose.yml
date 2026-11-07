@@ -64,11 +64,12 @@ services:
     command:
       - --http-address=0.0.0.0:4180
       - --provider=github
-      - --scope=user:email
+      - --scope=user:email read:org
       - --email-domain=*
       - --authenticated-emails-file=/etc/oauth2-proxy/allowed_emails
       - --redirect-url=https://151.145.93.209.nip.io/oauth2/callback
       - --cookie-domain=151.145.93.209.nip.io
+      - --whitelist-domain=151.145.93.209.nip.io
       - --upstream=static://200
       - --skip-provider-button=true
       - --reverse-proxy=true
