@@ -11,7 +11,8 @@ WorkingDirectory=/home/ubuntu/apex_quant
 EnvironmentFile=/home/ubuntu/apex_quant/deploy/phase2/risk-gate.env
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONUNBUFFERED=1
-UMask=0077
+UMask=0002
+ExecStartPre=+/home/ubuntu/apex_quant/deploy/bootstrap-permissions.sh
 ExecStartPre=/home/ubuntu/miniforge3/envs/apex_env/bin/python -m server.risk_engine check
 ExecStart=/home/ubuntu/miniforge3/envs/apex_env/bin/python -u -m server.autonomous_runner
 Restart=on-failure

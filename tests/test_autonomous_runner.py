@@ -122,6 +122,63 @@ def test_order_routing_requires_explicit_enablement_and_promoted_brain_strategy(
     assert runner._order_routing_authorized("stock")
 
 
+def _bare_runner(risk_gate, monkeypatch, tmp_path):
+    runner = AutonomousRunner.__new__(AutonomousRunner)
+    runner.settings = SimpleNamespace(mode=runner_module.TradingMode.PAPER)
+    runner.risk_gate = risk_gate
+    runner.symbols = ("SPY",)
+    runner.risk_gateway_halted = False
+    runner.risk_gateway_halt_reason = ""
+    runner.risk_gate_restricted = False
+    runner.risk_gate_restricted_reason = ""
+    runner.heartbeat_status = "waiting"
+    runner.heartbeat_message = ""
+    runner.session_day = None
+    monkeypatch.setattr(runner_module, "ROOT", tmp_path)
+    monkeypatch.setattr(
+        runner_module, "HEARTBEAT_PATH", tmp_path / "logs" / "runner_heartbeat.json",
+    )
+    return runner
+
+
+def test_missing_risk_gateway_auth_degrades_to_read_only_in_non_production(
+    monkeypatch, tmp_path,
+):
+    class MissingGate:
+        def configuration_status(self):
+            return {
+                "configured": False,
+                "reason": "Risk gateway authentication is not configured (RISK_GATE_TOKEN).",
+            }
+
+        def health(self):
+            raise AssertionError("health must not be called without credentials")
+
+    monkeypatch.setenv("APEX_ENV", "development")
+    monkeypatch.setenv("ALLOW_RISK_GATE_DEGRADED", "true")
+    runner = _bare_runner(MissingGate(), monkeypatch, tmp_path)
+
+    assert runner._check_risk_gateway() is True
+    assert runner.risk_gateway_halted is False
+    assert runner.risk_gate_restricted is True
+    assert not runner._order_routing_authorized("stock")
+    with pytest.raises(runner_module.RiskGateUnavailable):
+        runner._authorize_order_mutation("close_position", symbol="SPY")
+
+
+def test_missing_risk_gateway_auth_still_halts_in_production(monkeypatch, tmp_path):
+    class MissingGate:
+        def configuration_status(self):
+            return {"configured": False, "reason": "not configured"}
+
+    monkeypatch.setenv("APEX_ENV", "production")
+    runner = _bare_runner(MissingGate(), monkeypatch, tmp_path)
+
+    assert runner._check_risk_gateway() is False
+    assert runner.risk_gateway_halted is True
+    assert runner.risk_gate_restricted is False
+
+
 def test_alpaca_adapter_routes_only_protected_equity_orders():
     class Client:
         def submit_bracket(self, payload):

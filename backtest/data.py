@@ -15,8 +15,11 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
+from pathlib import Path
 from typing import Dict, Iterable, List
 from zoneinfo import ZoneInfo
+
+from server.io_utils import ensure_directory, secure_file
 
 NY = ZoneInfo("America/New_York")
 RTH_OPEN, RTH_CLOSE = time(9, 30), time(16, 0)
@@ -130,8 +133,11 @@ def load_dir(directory: str, symbols: List[str], naive_tz: str = "UTC") -> Dict[
 
 
 def save_csv(path: str, bars: List[MinuteBar]) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", newline="") as f:
+    target = Path(path)
+    if str(target.parent) not in {"", "."}:
+        ensure_directory(target.parent)
+    with target.open("w", newline="") as f:
+        secure_file(target)
         w = csv.writer(f)
         w.writerow(["timestamp", "open", "high", "low", "close", "volume"])
         for b in bars:

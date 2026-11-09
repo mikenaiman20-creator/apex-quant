@@ -12,6 +12,8 @@ from pathlib import Path
 from pprint import pformat
 from typing import Any
 
+from server.io_utils import atomic_write_text, ensure_directory, secure_file
+
 log = logging.getLogger("apex.research.brain")
 VALID_STATUSES = {"untested", "simulating", "promoted", "rejected"}
 MIN_SIMULATION_TRADES = 20
@@ -26,13 +28,28 @@ DEFAULT_BRAIN_PATH = Path(__file__).resolve().parents[2] / "data" / "knowledge_b
 class KnowledgeBrain:
     def __init__(self, path: Path = DEFAULT_BRAIN_PATH):
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_directory(self.path.parent)
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=10)
+        ensure_directory(self.path.parent)
+        connection = sqlite3.connect(self.path, timeout=30)
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout=10000")
+        connection.execute("PRAGMA busy_timeout=30000")
+        try:
+            connection.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.Error:
+            log.warning("SQLite WAL is unavailable for %s; falling back to rollback journal.",
+                        self.path)
+            try:
+                connection.execute("PRAGMA journal_mode=DELETE")
+            except sqlite3.Error:
+                pass
+        try:
+            connection.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.Error:
+            pass
+        secure_file(self.path)
         return connection
 
     @contextmanager
@@ -88,6 +105,8 @@ class KnowledgeBrain:
                 "CREATE INDEX IF NOT EXISTS strategies_status_score "
                 "ON strategies(status, conviction_score DESC)"
             )
+        for suffix in ("", "-wal", "-shm"):
+            secure_file(self.path.with_name(self.path.name + suffix))
 
     def record_source(
         self, source_url: str, title: str, source_type: str,
@@ -370,29 +389,11 @@ def compile_research_variant(candidate: dict[str, Any], directory: Path) -> Path
         f"STRATEGY_SPEC = {pformat(strategy, sort_dicts=True, width=88)}\n"
     )
     compile(source, f"variant_{variant_id}.py", "exec")
-    directory.mkdir(parents=True, exist_ok=True)
+    ensure_directory(directory)
     target = directory / f"variant_{variant_id}.py"
     if target.is_file() and target.read_text(encoding="utf-8") == source:
         return target
-
-    temp = target.with_name(
-        f".{target.name}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp"
-    )
-    try:
-        temp.write_text(source, encoding="utf-8")
-        for attempt in range(5):
-            try:
-                os.replace(temp, target)
-                return target
-            except OSError:
-                if attempt == 4:
-                    raise
-                time.sleep(0.05 * (attempt + 1))
-    finally:
-        try:
-            temp.unlink()
-        except FileNotFoundError:
-            pass
+    atomic_write_text(target, source)
     return target
 
 

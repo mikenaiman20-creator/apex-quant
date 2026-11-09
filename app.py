@@ -53,6 +53,27 @@ def _read_json(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     return value, None
 
 
+def _safe_is_file(path: Path) -> bool:
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
+def _safe_is_dir(path: Path) -> bool:
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
+
+
+def _safe_stat(path: Path):
+    try:
+        return path.stat()
+    except OSError:
+        return None
+
+
 def _read_events(path: Path, limit: int = 100) -> list[dict[str, str]]:
     try:
         with path.open("rb") as file:
@@ -84,36 +105,42 @@ def _read_events(path: Path, limit: int = 100) -> list[dict[str, str]]:
 @st.cache_data(ttl=30, show_spinner=False)
 def _read_knowledge_database(path_text: str, modified_ns: int) -> dict[str, Any]:
     path = Path(path_text)
-    if not path.is_file():
-        return {"error": "Knowledge Brain SQLite database is not present in the production data mount."}
-    uri = f"{path.as_uri()}?mode=ro"
-    try:
-        connection = sqlite3.connect(uri, uri=True, timeout=2)
-        connection.row_factory = sqlite3.Row
+    if not _safe_is_file(path):
+        return {"error": "Knowledge Brain SQLite database is not present or readable in the production data mount."}
+    last_error: Exception | None = None
+    for suffix in ("?mode=ro", "?mode=ro&immutable=1"):
+        uri = f"{path.as_uri()}{suffix}"
         try:
-            connection.execute("PRAGMA query_only=ON")
-            integrity = connection.execute("PRAGMA quick_check").fetchone()[0]
-            counts = {
-                row["status"]: row["count"]
-                for row in connection.execute(
-                    "SELECT status, COUNT(*) AS count FROM strategies GROUP BY status"
-                )
-            }
-            source_count = connection.execute(
-                "SELECT COUNT(*) FROM ingestion_sources"
-            ).fetchone()[0]
-            rows = connection.execute(
-                """
-                SELECT id, category, conviction_score, status, created_at, strategy_json
-                FROM strategies
-                ORDER BY created_at DESC, id DESC
-                LIMIT 100
-                """
-            ).fetchall()
-        finally:
-            connection.close()
-    except (OSError, sqlite3.Error) as exc:
-        return {"error": f"Knowledge Brain SQLite read failed: {exc}"}
+            connection = sqlite3.connect(uri, uri=True, timeout=2)
+            connection.row_factory = sqlite3.Row
+            try:
+                connection.execute("PRAGMA query_only=ON")
+                integrity = connection.execute("PRAGMA quick_check").fetchone()[0]
+                counts = {
+                    row["status"]: row["count"]
+                    for row in connection.execute(
+                        "SELECT status, COUNT(*) AS count FROM strategies GROUP BY status"
+                    )
+                }
+                source_count = connection.execute(
+                    "SELECT COUNT(*) FROM ingestion_sources"
+                ).fetchone()[0]
+                rows = connection.execute(
+                    """
+                    SELECT id, category, conviction_score, status, created_at, strategy_json
+                    FROM strategies
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 100
+                    """
+                ).fetchall()
+            finally:
+                connection.close()
+            break
+        except (OSError, sqlite3.Error) as exc:
+            last_error = exc
+            continue
+    else:
+        return {"error": f"Knowledge Brain SQLite read failed: {last_error}"}
 
     strategies = []
     for row in rows:
@@ -171,12 +198,15 @@ def _number(value: Any, suffix: str = "") -> str:
 
 
 def _rag_paths() -> list[Path]:
-    paths = [ROOT / "app.py"] if (ROOT / "app.py").is_file() else []
-    if SOURCE_ROOT.is_dir():
-        paths.extend(sorted(
-            path for path in SOURCE_ROOT.rglob("*.py")
-            if "__pycache__" not in path.parts
-        )[:RAG_MAX_DOCUMENTS])
+    paths = [ROOT / "app.py"] if _safe_is_file(ROOT / "app.py") else []
+    if _safe_is_dir(SOURCE_ROOT):
+        try:
+            paths.extend(sorted(
+                path for path in SOURCE_ROOT.rglob("*.py")
+                if "__pycache__" not in path.parts
+            )[:RAG_MAX_DOCUMENTS])
+        except OSError:
+            pass
     for name in (
         "daily_profile.json", "research_state.json", "research_agent_state.json",
         "research_brain_state.json", "strategy_audit_report.json",
@@ -185,17 +215,23 @@ def _rag_paths() -> list[Path]:
         "risk_audit.jsonl",
     ):
         path = (DATA if name == "strategy_arsenal.json" else LOGS) / name
-        if path.is_file():
+        if _safe_is_file(path):
             paths.append(path)
     for path in (
         DATA / "strategy_arsenal.json",
         DATA / "macro_events.json",
     ):
-        if path.is_file():
+        if _safe_is_file(path):
             paths.append(path)
-    if (DATA / "staging").is_dir():
-        paths.extend(sorted((DATA / "staging").glob("*.json"))[:20])
-    paths.extend(sorted(Path("/tmp").glob("*.log"))[:5])
+    if _safe_is_dir(DATA / "staging"):
+        try:
+            paths.extend(sorted((DATA / "staging").glob("*.json"))[:20])
+        except OSError:
+            pass
+    try:
+        paths.extend(sorted(Path("/tmp").glob("*.log"))[:5])
+    except OSError:
+        pass
     return list(dict.fromkeys(paths))[:RAG_MAX_DOCUMENTS]
 
 
@@ -544,9 +580,9 @@ def _render_dashboard() -> None:
     st.title("Apex Quant")
     st.caption("Production monitor · read-only · PAPER execution only")
     if snapshots_missing:
-        if not LOGS.is_dir() or not DATA.is_dir():
+        if not _safe_is_dir(LOGS) or not _safe_is_dir(DATA):
             st.error(
-                "Production telemetry is not mounted. "
+                "Production telemetry is not mounted or readable. "
                 "Mount the VPS data/ and logs/ directories read-only at /app/data and /app/logs."
             )
         else:
@@ -573,6 +609,8 @@ def _render_dashboard() -> None:
     orders = paper.get("orders", []) if isinstance(paper, dict) else []
     telemetry = (heartbeat or {}).get("telemetry")
     telemetry = telemetry if isinstance(telemetry, dict) else {}
+    risk_gate = (heartbeat or {}).get("risk_gate")
+    risk_gate = risk_gate if isinstance(risk_gate, dict) else {}
     knowledge = (brain or {}).get("knowledge_brain", {})
     knowledge = knowledge if isinstance(knowledge, dict) else {}
 
@@ -593,8 +631,28 @@ def _render_dashboard() -> None:
         if snapshot_age is None or snapshot_age > 600 or snapshot_age < -30:
             st.warning("Paper account snapshot is stale; values below are last known, not live.")
 
-    if runner_status == "DISCONNECTED":
-        st.error((heartbeat or {}).get("message") or "Runner heartbeat is missing or stale.")
+    risk_state = str(risk_gate.get("state", "")).lower()
+    if risk_state == "restricted" or runner_status == "RESTRICTED":
+        st.warning(
+            "Risk gate configuration warning: "
+            + str(
+                risk_gate.get("reason")
+                or (heartbeat or {}).get("message")
+                or "risk gateway credentials are not configured"
+            )
+            + " The runner remains read-only/paper-safe; no broker orders are submitted. "
+            "This is a configuration warning, not a fatal runner exception."
+        )
+    elif runner_status == "DISCONNECTED":
+        st.error(
+            (heartbeat or {}).get("message")
+            or "Runner heartbeat is missing or stale. Check the runner service and logs/ volume permissions."
+        )
+    elif risk_state == "halted":
+        st.error(
+            "Risk gate halt: "
+            + str(risk_gate.get("reason") or "broker order changes are stopped")
+        )
     elif heartbeat:
         st.success((heartbeat or {}).get("message") or "Runner heartbeat is current.")
 
@@ -652,7 +710,7 @@ def _render_dashboard() -> None:
         )
         st.subheader("Deployment health")
         module_health = [
-            {"module": name, "mounted": (SOURCE_ROOT / name).is_dir()}
+            {"module": name, "mounted": _safe_is_dir(SOURCE_ROOT / name)}
             for name in SOURCE_MODULES
         ]
         _table(module_health, ("module", "mounted"))
@@ -871,8 +929,16 @@ def _render_dashboard() -> None:
         st.subheader("Candidates awaiting human review")
         candidate_dir = DATA / "staging"
         candidates = []
-        if candidate_dir.is_dir():
-            for path in sorted(candidate_dir.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+        if _safe_is_dir(candidate_dir):
+            try:
+                candidate_paths = sorted(
+                    candidate_dir.glob("*.json"),
+                    key=lambda item: (_safe_stat(item).st_mtime if _safe_stat(item) else 0),
+                    reverse=True,
+                )
+            except OSError:
+                candidate_paths = []
+            for path in candidate_paths:
                 candidate, _ = _read_json(path)
                 if (
                     candidate

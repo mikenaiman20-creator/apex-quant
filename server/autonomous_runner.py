@@ -47,6 +47,12 @@ from engine.strategy import (
 )
 from server.broker_adapters import AlpacaPaperAdapter, BaseBrokerAdapter
 from server.ingestion.brain import KnowledgeBrain
+from server.io_utils import (
+    apply_shared_umask,
+    atomic_write_json,
+    ensure_directory,
+    secure_file,
+)
 from server.risk_engine import RiskGateClient, RiskGateRejected, RiskGateUnavailable
 from server.universe import DynamicUniverseSelector
 from server.event_guard import GuardDecision, MacroEventGuard
@@ -75,18 +81,22 @@ log = logging.getLogger("apex.autonomous")
 _heartbeat_lock = threading.Lock()
 _heartbeat_telemetry: dict[str, Any] | None = None
 _heartbeat_crypto_symbols: tuple[str, ...] = ()
+_heartbeat_risk_gate: dict[str, Any] | None = None
 
 
 def write_heartbeat(status: str, message: str = "", symbols: tuple[str, ...] = (),
                     telemetry: dict[str, Any] | None = None,
-                    crypto_symbols: tuple[str, ...] | None = None) -> None:
-    global _heartbeat_telemetry, _heartbeat_crypto_symbols
+                    crypto_symbols: tuple[str, ...] | None = None,
+                    risk_gate: dict[str, Any] | None = None) -> bool:
+    """Publish runner heartbeat best-effort; telemetry failures never crash the runner."""
+    global _heartbeat_telemetry, _heartbeat_crypto_symbols, _heartbeat_risk_gate
     with _heartbeat_lock:
         if telemetry is not None:
             _heartbeat_telemetry = telemetry
         if crypto_symbols is not None:
             _heartbeat_crypto_symbols = crypto_symbols
-        HEARTBEAT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if risk_gate is not None:
+            _heartbeat_risk_gate = risk_gate
         record = {
             "timestamp": time.time(),
             "pid": os.getpid(),
@@ -95,26 +105,14 @@ def write_heartbeat(status: str, message: str = "", symbols: tuple[str, ...] = (
             "symbols": list(symbols),
             "crypto_symbols": list(_heartbeat_crypto_symbols),
             "telemetry": _heartbeat_telemetry,
+            "risk_gate": _heartbeat_risk_gate,
         }
-        temp_path = HEARTBEAT_PATH.with_name(
-            f".{HEARTBEAT_PATH.name}.{os.getpid()}.{threading.get_ident()}."
-            f"{time.time_ns()}.tmp"
-        )
         try:
-            temp_path.write_text(json.dumps(record), encoding="utf-8")
-            for attempt in range(5):
-                try:
-                    os.replace(temp_path, HEARTBEAT_PATH)
-                    return
-                except OSError:
-                    if attempt == 4:
-                        raise
-                    time.sleep(0.05 * (attempt + 1))
-        finally:
-            try:
-                temp_path.unlink()
-            except FileNotFoundError:
-                pass
+            atomic_write_json(HEARTBEAT_PATH, record)
+            return True
+        except (OSError, TypeError, ValueError):
+            log.exception("Unable to publish runner heartbeat to %s.", HEARTBEAT_PATH)
+            return False
 
 
 def write_dashboard_paper_snapshot(
@@ -151,17 +149,10 @@ def write_dashboard_paper_snapshot(
         "orders": [select_fields(item, order_fields) for item in orders],
     }
     path = ROOT / "logs" / "paper_dashboard_snapshot.json"
-    temp_path = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path.write_text(json.dumps(record, allow_nan=False), encoding="utf-8")
-        os.replace(temp_path, path)
+        atomic_write_json(path, record)
     except (OSError, TypeError, ValueError):
         log.exception("Unable to publish paper account snapshot for the read-only dashboard.")
-        try:
-            temp_path.unlink()
-        except FileNotFoundError:
-            pass
 
 
 def write_dashboard_market_snapshot(market: dict[str, dict[str, Any]]) -> None:
@@ -201,17 +192,10 @@ def write_dashboard_market_snapshot(market: dict[str, dict[str, Any]]) -> None:
         "symbols": clean_market,
     }
     path = ROOT / "logs" / "market_dashboard_snapshot.json"
-    temp_path = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path.write_text(json.dumps(record, allow_nan=False), encoding="utf-8")
-        os.replace(temp_path, path)
+        atomic_write_json(path, record)
     except (OSError, TypeError, ValueError):
         log.exception("Unable to publish sanitized market data for the read-only dashboard.")
-        try:
-            temp_path.unlink()
-        except FileNotFoundError:
-            pass
 
 
 class AlpacaAPIError(RuntimeError):
@@ -395,8 +379,8 @@ class ManagedPosition:
 
 
 def configure_logging() -> None:
-    log_dir = ROOT / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
+    apply_shared_umask()
+    log_dir = ensure_directory(ROOT / "logs")
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
     class JsonFormatter(logging.Formatter):
@@ -411,16 +395,25 @@ def configure_logging() -> None:
                 entry["exception"] = self.formatException(record.exc_info)
             return json.dumps(entry, ensure_ascii=True)
 
-    file_handler = RotatingFileHandler(log_dir / "autonomous.log", maxBytes=5_000_000,
-                                       backupCount=5, encoding="utf-8")
-    file_handler.setFormatter(JsonFormatter())
+    handlers: list[logging.Handler] = []
+    try:
+        file_handler = RotatingFileHandler(
+            log_dir / "autonomous.log", maxBytes=5_000_000,
+            backupCount=5, encoding="utf-8",
+        )
+        secure_file(log_dir / "autonomous.log")
+        file_handler.setFormatter(JsonFormatter())
+        handlers.append(file_handler)
+    except OSError:
+        log.exception("Unable to open the persistent runner log; continuing on journald only.")
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    handlers.append(console_handler)
     for handler in root_logger.handlers[:]:
         root_logger.removeHandler(handler)
         handler.close()
-    root_logger.addHandler(file_handler)
-    root_logger.addHandler(console_handler)
+    for handler in handlers:
+        root_logger.addHandler(handler)
     log.handlers.clear()
     log.propagate = True
 
@@ -428,8 +421,9 @@ def configure_logging() -> None:
 @contextmanager
 def single_instance_lock():
     lock_path = ROOT / "logs" / "autonomous.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_directory(lock_path.parent)
     lock_file = lock_path.open("a+b")
+    secure_file(lock_path)
     acquired = False
     try:
         if os.name == "nt":
@@ -692,6 +686,8 @@ class AutonomousRunner:
         self.halted = False
         self.risk_gateway_halted = False
         self.risk_gateway_halt_reason = ""
+        self.risk_gate_restricted = False
+        self.risk_gate_restricted_reason = ""
         self.last_reconciliation_at = 0.0
         self.flattened_day = None
         self.prepared_day: date | None = None
@@ -717,14 +713,26 @@ class AutonomousRunner:
         )
 
     def _order_routing_authorized(self, asset_class: str) -> bool:
+        if getattr(self, "risk_gate_restricted", False):
+            log.info(
+                "Order routing locked: risk gateway is in read-only configuration fallback."
+            )
+            return False
         if os.getenv("ENABLE_ORDER_ROUTING", "false").strip().lower() != "true":
             log.info("Order routing locked: ENABLE_ORDER_ROUTING is not true.")
             return False
         if self.settings.mode is not TradingMode.PAPER:
             log.error("Order routing locked: autonomous runner supports PAPER mode only.")
             return False
-        brain = KnowledgeBrain(ROOT / "data" / "knowledge_brain.sqlite")
-        if not brain.has_promoted_strategy(asset_class):
+        try:
+            brain = KnowledgeBrain(ROOT / "data" / "knowledge_brain.sqlite")
+            promoted = brain.has_promoted_strategy(asset_class)
+        except Exception:
+            log.exception(
+                "Order routing locked for %s: Knowledge Brain is not readable.", asset_class,
+            )
+            return False
+        if not promoted:
             log.info(
                 "Order routing locked for %s: no Gate 1-3 promoted strategy is available.",
                 asset_class,
@@ -732,10 +740,91 @@ class AutonomousRunner:
             return False
         return True
 
+    def _risk_gate_configuration(self) -> dict[str, Any]:
+        getter = getattr(self.risk_gate, "configuration_status", None)
+        if callable(getter):
+            try:
+                status = getter()
+            except Exception:
+                log.exception("Unable to read risk gateway configuration status.")
+                status = None
+            if isinstance(status, dict):
+                return status
+        # Unknown client implementations are assumed configured; health() decides.
+        return {"configured": True, "reason": None}
+
+    def _degraded_read_only_allowed(self) -> bool:
+        """Allow a read-only fallback only for non-production PAPER deployments."""
+        if self.settings.mode is not TradingMode.PAPER:
+            return False
+        environment = os.getenv("APEX_ENV", "development").strip().lower()
+        if environment in {"prod", "production", "live"}:
+            return False
+        return os.getenv(
+            "ALLOW_RISK_GATE_DEGRADED", "true"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _is_risk_configuration_error(reason: str) -> bool:
+        return "not configured" in reason.strip().lower()
+
+    def _risk_gate_telemetry(self) -> dict[str, Any]:
+        if self.risk_gateway_halted:
+            state = "halted"
+        elif self.risk_gate_restricted:
+            state = "restricted"
+        else:
+            state = "ok"
+        configuration = self._risk_gate_configuration()
+        return {
+            "state": state,
+            "reason": (
+                self.risk_gateway_halt_reason
+                or self.risk_gate_restricted_reason
+                or ""
+            ),
+            "configured": configuration.get("configured"),
+            "base_url": configuration.get("base_url"),
+        }
+
+    def _enter_read_only_mode(self, reason: str) -> None:
+        if self.risk_gate_restricted and self.risk_gate_restricted_reason == reason:
+            return
+        self.risk_gate_restricted = True
+        self.risk_gate_restricted_reason = reason
+        self.heartbeat_status = "restricted"
+        self.heartbeat_message = (
+            f"RISK CONFIG WARNING: {reason} Runner is in read-only paper-safe mode; "
+            "no broker orders will be submitted."
+        )
+        log.warning(self.heartbeat_message)
+        try:
+            write_heartbeat(
+                self.heartbeat_status, self.heartbeat_message, self.symbols,
+                risk_gate=self._risk_gate_telemetry(),
+                telemetry={
+                    "event": "risk_gate_configuration_warning",
+                    "reason": reason,
+                    "mode": "read_only",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+        except OSError:
+            log.exception("Unable to publish the risk configuration warning heartbeat.")
+
+    def _exit_read_only_mode(self) -> None:
+        if not self.risk_gate_restricted:
+            return
+        self.risk_gate_restricted = False
+        self.risk_gate_restricted_reason = ""
+        log.info("Risk gateway authentication restored; leaving read-only mode.")
+
     def _halt_for_risk_gateway(self, reason: str) -> None:
         self.risk_gateway_halted = True
         self.risk_gateway_halt_reason = reason
         self.halted = True
+        self.risk_gate_restricted = False
+        self.risk_gate_restricted_reason = ""
         self.heartbeat_status = "disconnected"
         self.heartbeat_message = (
             f"RISK GATE HALT: {reason}; all broker order changes are stopped."
@@ -749,6 +838,7 @@ class AutonomousRunner:
         try:
             write_heartbeat(
                 self.heartbeat_status, self.heartbeat_message, self.symbols,
+                risk_gate=self._risk_gate_telemetry(),
                 telemetry={
                     "event": "risk_gateway_halt",
                     "reason": reason,
@@ -761,17 +851,38 @@ class AutonomousRunner:
     def _check_risk_gateway(self) -> bool:
         if self.risk_gateway_halted:
             return False
+        configuration = self._risk_gate_configuration()
+        if configuration.get("configured") is False:
+            reason = str(
+                configuration.get("reason")
+                or "Risk gateway authentication is not configured."
+            )
+            if self._degraded_read_only_allowed():
+                self._enter_read_only_mode(reason)
+                return True
+            self._halt_for_risk_gateway(reason)
+            return False
         try:
             self.risk_gate.health()
         except RiskGateUnavailable as exc:
-            self._halt_for_risk_gateway(str(exc))
+            reason = str(exc)
+            if (
+                self._is_risk_configuration_error(reason)
+                and self._degraded_read_only_allowed()
+            ):
+                self._enter_read_only_mode(reason)
+                return True
+            self._halt_for_risk_gateway(reason)
             return False
+        self._exit_read_only_mode()
         return True
 
     def _authorize_order_mutation(self, operation: str, **details: Any) -> None:
-        if self.risk_gateway_halted:
+        if self.risk_gateway_halted or self.risk_gate_restricted:
             raise RiskGateUnavailable(
-                self.risk_gateway_halt_reason or "risk gateway is latched halted"
+                self.risk_gateway_halt_reason
+                or self.risk_gate_restricted_reason
+                or "risk gateway is not available for order mutations"
             )
         request = {
             "request_id": str(uuid.uuid4()),
@@ -793,6 +904,9 @@ class AutonomousRunner:
         try:
             candidate = json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
+            return
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            log.warning("Ignoring unreadable approved candidate %s: %s", path, exc)
             return
         if (candidate.get("status") != "approved_for_paper"
                 or candidate.get("human_approved") is not True):
@@ -823,6 +937,8 @@ class AutonomousRunner:
 
     def _cleanup_identified_test_positions(self, market_open: bool) -> bool:
         """Close only filled positions attributable to the explicitly named paper test-order IDs."""
+        if self.risk_gate_restricted:
+            return False
         positions = {
             position["symbol"]: position for position in self.client.positions()
             if position.get("symbol") in self.settings.watchlist
@@ -1091,10 +1207,7 @@ class AutonomousRunner:
             "simulated_transaction_costs": oos_metrics["costs"],
         }
         profile_path = ROOT / "logs" / "daily_profile.json"
-        profile_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = profile_path.with_suffix(".json.tmp")
-        temp_path.write_text(json.dumps(profile_record, indent=2, allow_nan=False), encoding="utf-8")
-        temp_path.replace(profile_path)
+        atomic_write_json(profile_path, profile_record, indent=2)
         log.info(
             "Daily walk-forward candidate %s; no active parameters changed without human approval: %s",
             audit["status"], json.dumps(profile_record, allow_nan=False),
@@ -1356,8 +1469,13 @@ class AutonomousRunner:
             self.session_day = day
             state_path = ROOT / "logs" / "session_guard.json"
             previous = {}
-            if state_path.exists():
+            try:
                 previous = json.loads(state_path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                previous = {}
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                log.warning("Ignoring unreadable session guard %s: %s", state_path, exc)
+                previous = {}
             if previous.get("session_date") == day.isoformat():
                 self.session_equity = float(previous["starting_equity"])
                 self.halted = bool(previous.get("halted", False))
@@ -1371,17 +1489,23 @@ class AutonomousRunner:
 
     def _persist_session_guard(self) -> None:
         state_path = ROOT / "logs" / "session_guard.json"
-        state_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = state_path.with_suffix(".json.tmp")
-        temp_path.write_text(json.dumps({
-            "session_date": self.session_day.isoformat(),
-            "starting_equity": self.session_equity,
-            "halted": self.halted,
-        }), encoding="utf-8")
-        temp_path.replace(state_path)
+        try:
+            atomic_write_json(state_path, {
+                "session_date": self.session_day.isoformat(),
+                "starting_equity": self.session_equity,
+                "halted": self.halted,
+            })
+        except OSError:
+            log.exception("Unable to persist the session guard state.")
 
     def _kill_switch(self, now: datetime, positions: dict[str, dict[str, Any]]) -> bool:
         if self.halted:
+            if self.risk_gate_restricted:
+                log.warning(
+                    "Session halt active, but risk configuration fallback is read-only; "
+                    "broker cancellation is suppressed."
+                )
+                return True
             self._authorize_order_mutation(
                 "cancel_orders", symbols=list(self.symbols), purpose="session_halt",
             )
@@ -1415,6 +1539,11 @@ class AutonomousRunner:
             "timestamp": now.isoformat(),
         }
         write_heartbeat("active", message[:240], self.symbols, telemetry)
+        if self.risk_gate_restricted:
+            log.warning(
+                "Read-only risk configuration fallback; kill-switch broker actions suppressed."
+            )
+            return True
         self._authorize_order_mutation(
             "cancel_orders", symbols=list(self.symbols), purpose="daily_drawdown_kill",
         )
@@ -1429,6 +1558,12 @@ class AutonomousRunner:
 
     def _flatten_positions(self, positions: dict[str, dict[str, Any]], session_day: date) -> None:
         if self.flattened_day == session_day:
+            return
+        if self.risk_gate_restricted:
+            log.warning(
+                "Read-only risk configuration fallback; closing-bell flatten suppressed for %s.",
+                session_day,
+            )
             return
         for symbol in positions:
             self._authorize_order_mutation(
@@ -1452,6 +1587,8 @@ class AutonomousRunner:
         return None
 
     def _manage_stops(self, positions: dict[str, dict[str, Any]]) -> None:
+        if self.risk_gate_restricted:
+            return
         for symbol, position in positions.items():
             managed = self.managed.get(symbol)
             state = self.states[symbol]
@@ -1890,14 +2027,18 @@ class AutonomousRunner:
             except (urllib.error.URLError, TimeoutError, AlpacaAPIError, ValueError) as exc:
                 self._log_crypto_research_failure(exc)
         if not clock.get("is_open"):
-            self.heartbeat_status = "waiting"
+            self.heartbeat_status = "restricted" if self.risk_gate_restricted else "waiting"
             crypto_state = (
                 f" Crypto research is active for {', '.join(self.crypto_symbols)}; order routing disabled."
                 if self.crypto_symbols else ""
             )
+            risk_state = (
+                " Risk configuration fallback: read-only paper-safe mode."
+                if self.risk_gate_restricted else ""
+            )
             self.heartbeat_message = (
                 f"Equity market closed; next open {clock.get('next_open', 'unknown')}."
-                + crypto_state
+                + crypto_state + risk_state
             )
             write_heartbeat(
                 self.heartbeat_status, self.heartbeat_message, self.symbols,
@@ -1933,10 +2074,15 @@ class AutonomousRunner:
                 return min(seconds, 60.0 if self.crypto_symbols else 300.0)
             log.info("Market closed; next open=%s.", clock.get("next_open"))
             return 60.0
-        self.heartbeat_status = "active"
-        self.heartbeat_message = "Market open; runner cycle connected."
+        self.heartbeat_status = "restricted" if self.risk_gate_restricted else "active"
+        self.heartbeat_message = (
+            "Market open; runner cycle connected in read-only paper-safe mode."
+            if self.risk_gate_restricted
+            else "Market open; runner cycle connected."
+        )
         write_heartbeat(self.heartbeat_status, self.heartbeat_message, self.symbols,
-                        crypto_symbols=self.crypto_symbols)
+                        crypto_symbols=self.crypto_symbols,
+                        risk_gate=self._risk_gate_telemetry())
         if self._cleanup_identified_test_positions(market_open=True):
             return POLL_SECONDS
         session_open = _bar_time(clock.get("timestamp", now.isoformat()))
@@ -1968,14 +2114,26 @@ class AutonomousRunner:
             )
             write_heartbeat("active", self.heartbeat_message, self.symbols)
             return POLL_SECONDS
-        self._refresh_quotes(now)
-        self._manage_stops(positions)
-        start = min(self.watermarks.values()) + BAR_INTERVAL
-        bars = self.client.bars(self.symbols, "1Min", start, now, limit=10000)
-        self._process_bars(
-            bars, now, account, positions, orders,
-            entry_blocker=macro_guard.reason if macro_guard.blocked else None,
-        )
+        try:
+            self._refresh_quotes(now)
+            self._manage_stops(positions)
+            start = min(self.watermarks.values()) + BAR_INTERVAL
+            bars = self.client.bars(self.symbols, "1Min", start, now, limit=10000)
+            self._process_bars(
+                bars, now, account, positions, orders,
+                entry_blocker=macro_guard.reason if macro_guard.blocked else None,
+            )
+        except Exception:
+            self.heartbeat_status = "restricted" if self.risk_gate_restricted else "active"
+            self.heartbeat_message = (
+                "Strategy cycle failed; telemetry, heartbeat, and account snapshot remain active."
+            )
+            write_heartbeat(
+                self.heartbeat_status, self.heartbeat_message, self.symbols,
+                risk_gate=self._risk_gate_telemetry(),
+                crypto_symbols=self.crypto_symbols,
+            )
+            log.exception("Strategy cycle failed; telemetry continues and the runner will retry.")
         self._publish_dashboard_market_snapshot()
         return POLL_SECONDS
 

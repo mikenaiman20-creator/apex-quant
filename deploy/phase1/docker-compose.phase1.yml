@@ -1,8 +1,9 @@
 services:
   streamlit:
-    user: "${APEX_RUNTIME_UID:?Set APEX_RUNTIME_UID}:${APEX_RUNTIME_GID:?Set APEX_RUNTIME_GID}"
     environment:
       APEX_SOURCE_ROOT: /app/source
+      APEX_RUNTIME_UID: ${APEX_RUNTIME_UID:?Set APEX_RUNTIME_UID}
+      APEX_RUNTIME_GID: ${APEX_RUNTIME_GID:?Set APEX_RUNTIME_GID}
     volumes:
       - /home/ubuntu/apex_quant/backtest:/app/source/backtest:ro
       - /home/ubuntu/apex_quant/config:/app/source/config:ro

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from backtest.metrics import deflated_sharpe_probability
+from server.io_utils import atomic_write_json, ensure_directory, secure_file
 
 log = logging.getLogger("apex.evolution")
 ROOT = Path(__file__).resolve().parents[1]
@@ -123,9 +124,10 @@ def normalize_trial_ledger(value: Any) -> dict[str, Any]:
 @contextmanager
 def _trial_ledger_file_lock(path: Path):
     """Serialize ledger updates across CLI and worker processes."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_directory(path.parent)
     lock_path = path.with_name(f"{path.name}.lock")
     with lock_path.open("a+b") as lock_file:
+        secure_file(lock_path)
         lock_file.seek(0, os.SEEK_END)
         if lock_file.tell() == 0:
             lock_file.write(b"0")
@@ -210,10 +212,7 @@ def load_trial_ledger(path: Path = TRIAL_LEDGER_PATH, *, strict: bool = False) -
         else:
             original = None
         if existed and original != ledger:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            temp = path.with_suffix(".json.tmp")
-            temp.write_text(json.dumps(ledger, indent=2), encoding="utf-8")
-            temp.replace(path)
+            atomic_write_json(path, ledger, indent=2)
         return ledger
 
 
@@ -260,10 +259,7 @@ def register_trials(cycle_id: str, trial_count: int,
             ledger["recent_win_rates"] = (samples + valid_records)[-142:]
         ledger["last_updated_at"] = datetime.now(timezone.utc).isoformat()
         ledger["latest_cycle_id"] = cycle_id
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temp = path.with_suffix(".json.tmp")
-        temp.write_text(json.dumps(ledger, indent=2), encoding="utf-8")
-        temp.replace(path)
+        atomic_write_json(path, ledger, indent=2)
         return int(ledger["num_trials"])
 
 
@@ -284,10 +280,7 @@ def update_trial_activity(cycle_id: str, trial_count: int, status: str, message:
             "message": message,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temp = path.with_suffix(".json.tmp")
-        temp.write_text(json.dumps(ledger, indent=2), encoding="utf-8")
-        temp.replace(path)
+        atomic_write_json(path, ledger, indent=2)
         return ledger["latest_activity"]
 
 
@@ -316,10 +309,7 @@ def update_audit_research_activity(
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         audit["research_activity"] = activity
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temp = path.with_suffix(".json.tmp")
-        temp.write_text(json.dumps(audit, indent=2, allow_nan=False), encoding="utf-8")
-        temp.replace(path)
+        atomic_write_json(path, audit, indent=2)
         return activity
 
 
@@ -411,17 +401,12 @@ def stage_candidate(candidate: dict[str, Any], holdout: dict[str, Any],
             prior_audit = {}
         if isinstance(prior_audit, dict) and "research_activity" in prior_audit:
             audit["research_activity"] = prior_audit["research_activity"]
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temp = path.with_suffix(".json.tmp")
-        temp.write_text(json.dumps(audit, indent=2, allow_nan=False), encoding="utf-8")
-        temp.replace(path)
+        atomic_write_json(path, audit, indent=2)
         if passed:
-            staging_dir.mkdir(parents=True, exist_ok=True)
+            ensure_directory(staging_dir)
             staged = {**candidate, **audit, "human_approved": False}
             target = staging_dir / f"{candidate_id}.json"
-            staged_temp = target.with_suffix(".json.tmp")
-            staged_temp.write_text(json.dumps(staged, indent=2, allow_nan=False), encoding="utf-8")
-            staged_temp.replace(target)
+            atomic_write_json(target, staged, indent=2)
     log.info(
         "CANDIDATE AUDIT %s status=%s trials=%s raw_sharpe=%s deflated_probability=%s holdout=%s",
         candidate_id, audit["status"], audit["n_trials"], audit["raw_sharpe"],
@@ -444,13 +429,9 @@ def approve_candidate(candidate_id: str, staging_dir: Path = STAGING_DIR,
     candidate["human_approved"] = True
     from datetime import datetime, timezone
     candidate["approved_at"] = datetime.now(timezone.utc).isoformat()
-    active_path.parent.mkdir(parents=True, exist_ok=True)
-    temp = active_path.with_suffix(".json.tmp")
-    temp.write_text(json.dumps(candidate, indent=2, allow_nan=False), encoding="utf-8")
-    temp.replace(active_path)
-    staged_temp = path.with_suffix(".json.tmp")
-    staged_temp.write_text(json.dumps(candidate, indent=2, allow_nan=False), encoding="utf-8")
-    staged_temp.replace(path)
+    ensure_directory(active_path.parent)
+    atomic_write_json(active_path, candidate, indent=2)
+    atomic_write_json(path, candidate, indent=2)
     try:
         audit = json.loads(audit_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -459,9 +440,7 @@ def approve_candidate(candidate_id: str, staging_dir: Path = STAGING_DIR,
         audit["status"] = "approved_for_paper"
         audit["human_approved"] = True
         audit["approved_at"] = candidate["approved_at"]
-        audit_temp = audit_path.with_suffix(".json.tmp")
-        audit_temp.write_text(json.dumps(audit, indent=2, allow_nan=False), encoding="utf-8")
-        audit_temp.replace(audit_path)
+        atomic_write_json(audit_path, audit, indent=2)
     return candidate
 
 
@@ -550,10 +529,7 @@ class ArsenalEvolution:
                 )
         from datetime import datetime, timezone
         arsenal["updated_at"] = datetime.now(timezone.utc).isoformat()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = self.path.with_suffix(".json.tmp")
-        temp_path.write_text(json.dumps(arsenal, indent=2), encoding="utf-8")
-        temp_path.replace(self.path)
+        atomic_write_json(self.path, arsenal, indent=2)
         for message in messages:
             log.warning("STATISTICAL VERDICT %s", message)
         if not messages:

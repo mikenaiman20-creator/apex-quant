@@ -16,6 +16,7 @@ from backtest.holdout_lock import (
     verify as verify_holdout_lock,
 )
 from backtest.metrics import summarize, trade_equity_curve
+from server.io_utils import atomic_write_json
 from backtest.walkforward import apply_params
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -99,10 +100,7 @@ def validate_final_holdout(
             "missing_files": [],
         }
     datasets[dataset_id] = {"candidate_id": candidate_id, "status": "in_progress"}
-    ledger_path.parent.mkdir(parents=True, exist_ok=True)
-    temp = ledger_path.with_suffix(".json.tmp")
-    temp.write_text(json.dumps(ledger, indent=2), encoding="utf-8")
-    temp.replace(ledger_path)
+    atomic_write_json(ledger_path, ledger, indent=2)
     try:
         data = load_dir(str(directory), list(symbols))
     except (OSError, ValueError, KeyError) as exc:
@@ -114,8 +112,7 @@ def validate_final_holdout(
             "missing_files": [],
         }
         datasets[dataset_id] = {"candidate_id": candidate_id, "result": result}
-        temp.write_text(json.dumps(ledger, indent=2), encoding="utf-8")
-        temp.replace(ledger_path)
+        atomic_write_json(ledger_path, ledger, indent=2)
         return result
     if any(not bars for bars in data.values()):
         result = {
@@ -125,8 +122,7 @@ def validate_final_holdout(
             "missing_files": [],
         }
         datasets[dataset_id] = {"candidate_id": candidate_id, "result": result}
-        temp.write_text(json.dumps(ledger, indent=2), encoding="utf-8")
-        temp.replace(ledger_path)
+        atomic_write_json(ledger_path, ledger, indent=2)
         return result
     config = apply_params(base, params)
     result = (
@@ -157,6 +153,5 @@ def validate_final_holdout(
         },
     }
     datasets[dataset_id] = {"candidate_id": candidate_id, "result": result}
-    temp.write_text(json.dumps(ledger, indent=2), encoding="utf-8")
-    temp.replace(ledger_path)
+    atomic_write_json(ledger_path, ledger, indent=2)
     return result

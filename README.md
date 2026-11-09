@@ -206,6 +206,41 @@ Let's Encrypt, persistent storage, read-only source mounts, and VPS verification
 [`deploy/phase0/README.md`](./deploy/phase0/README.md). ChromaDB remains isolated and must not be
 enabled until its deployed runtime is verified safe for CVE-2026-45829.
 
+### Shared volume permissions
+
+`logs/` and `data/` are bind-mounted into containers that may run under a different UID than the
+host service. New files are created with an explicit shared mode (`0666`) and directories with
+`0777`; the container entrypoint and the host unit both attempt a best-effort correction:
+
+```sh
+sudo APEX_APP_ROOT=/home/ubuntu/apex_quant APEX_RUNTIME_UID=1001 APEX_RUNTIME_GID=1001 \
+  /home/ubuntu/apex_quant/deploy/bootstrap-permissions.sh
+```
+
+The systemd units run this script as root via `ExecStartPre=+...` and use `UMask=0002`. The
+Streamlit container mounts `logs/` and `data/` read-only, so a host-side correction is required
+for dashboard reads; its entrypoint can only correct writable mounts.
+
+### OAuth redirect and nip.io
+
+`OAUTH2_PROXY_REDIRECT_URL` must use the exact public scheme and host that the browser and
+GitHub OAuth application use, for example `https://<DASHBOARD_DOMAIN>/oauth2/callback`. Do not mix
+`http://` and `https://`: Nginx terminates TLS and forwards `X-Forwarded-Proto`, `X-Forwarded-Host`,
+and `X-Forwarded-Port`, while oauth2-proxy runs with `--reverse-proxy=true` and
+`--cookie-secure=true`. For staging, register the same HTTPS callback URL in the GitHub OAuth app.
+`nip.io` names resolve to the embedded IP but are not controlled by Apex Quant; browsers may warn
+if the certificate, callback scheme, or `Host` header disagree. Use a domain you control for any
+long-lived deployment, and keep the certificate hostname, `DASHBOARD_DOMAIN`,
+`OAUTH2_PROXY_COOKIE_DOMAIN`, and `OAUTH2_PROXY_REDIRECT_URL` aligned.
+
+### Risk gateway configuration fallback
+
+The autonomous runner is hard-fail in production and LIVE mode. In non-production PAPER mode a
+missing `RISK_GATE_TOKEN` now selects a strict read-only/paper-safe fallback instead of crashing the
+runner: heartbeats, snapshots, and research continue, but every broker order mutation is suppressed.
+Set `APEX_ENV=production` (or `ALLOW_RISK_GATE_DEGRADED=false`) to restore the hard halt. The
+dashboard shows this as a configuration warning and keeps fatal risk-gate halts visually separate.
+
 ## Unified paper supervisor
 
 Set `TRADING_MODE=PAPER`, `BROKER=ALPACA`, `ALPACA_API_KEY`, and `ALPACA_API_SECRET` in `.env`,

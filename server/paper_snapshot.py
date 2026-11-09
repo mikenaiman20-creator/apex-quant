@@ -5,8 +5,6 @@ import argparse
 import json
 import logging
 import math
-import os
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -15,6 +13,8 @@ from urllib.parse import urlencode
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from dotenv import dotenv_values
+
+from server.io_utils import atomic_write_json
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -96,24 +96,7 @@ def _selected_fields(item: dict[str, Any], fields: tuple[str, ...]) -> dict[str,
 
 
 def _write_snapshot(path: Path, snapshot: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        dir=path.parent,
-    )
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
-            json.dump(snapshot, file, allow_nan=False)
-            file.write("\n")
-            file.flush()
-            os.fsync(file.fileno())
-        os.replace(temporary_name, path)
-    finally:
-        try:
-            os.unlink(temporary_name)
-        except FileNotFoundError:
-            pass
+    atomic_write_json(path, snapshot)
 
 
 def refresh_snapshot(env_path: Path, output_path: Path) -> dict[str, Any]:

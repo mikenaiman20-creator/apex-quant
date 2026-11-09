@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 from engine.data_pipeline import Bar
 from engine.strategy import average_directional_index, simple_moving_average
+from server.io_utils import atomic_write_json
 
 log = logging.getLogger("apex.research")
 ROOT = Path(__file__).resolve().parents[1]
@@ -196,10 +197,7 @@ class StrategyResearcher:
 
     def _write_agent_state(self, state: dict[str, Any]) -> None:
         path = self._agent_state_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = path.with_suffix(".json.tmp")
-        temp_path.write_text(json.dumps(state, indent=2, allow_nan=False), encoding="utf-8")
-        temp_path.replace(path)
+        atomic_write_json(path, state, indent=2)
 
     def _discovery_files(self) -> list[tuple[str, Path]]:
         data_dir = self.root / "data"
@@ -618,10 +616,7 @@ class StrategyResearcher:
                     "until broker-native protective exits are verified.",
         }
         state_path = self.root / "logs" / "research_state.json"
-        state_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = state_path.with_suffix(".json.tmp")
-        temp_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
-        temp_path.replace(state_path)
+        atomic_write_json(state_path, state, indent=2)
         log.info("RESEARCH LOOP completed for %d symbols; research-only strategies=%d",
                  len(regimes), len(eligible))
         return state

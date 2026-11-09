@@ -26,6 +26,7 @@ from server.dashboard import create_server
 from server.evolution import ARSENAL_PATH, ArsenalEvolution
 from server.healer import diagnose_exception, install_exception_hooks
 from server.ingestion import ResearchIngestionWorker
+from server.io_utils import atomic_write_json
 from server.researcher import StrategyResearcher
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -413,14 +414,14 @@ def _watchdog(stop_event: threading.Event, components: dict[str, threading.Threa
         failed = [name for name, status in statuses.items() if status == "stopped"]
         if failed:
             log.error("WATCHDOG detected stopped components: %s", ", ".join(failed))
-        health_path.parent.mkdir(parents=True, exist_ok=True)
-        temp = health_path.with_suffix(".json.tmp")
-        temp.write_text(json.dumps({
-            "timestamp": time.time(),
-            "status": "active" if not failed else "degraded",
-            "components": statuses,
-        }, indent=2), encoding="utf-8")
-        temp.replace(health_path)
+        try:
+            atomic_write_json(health_path, {
+                "timestamp": time.time(),
+                "status": "active" if not failed else "degraded",
+                "components": statuses,
+            }, indent=2)
+        except OSError:
+            log.exception("Unable to publish master health telemetry.")
         stop_event.wait(15)
 
 

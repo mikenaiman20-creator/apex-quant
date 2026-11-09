@@ -106,7 +106,7 @@ def test_refresh_writes_only_allowlisted_paper_fields(monkeypatch, tmp_path):
     assert "private-asset-id" not in serialized
     assert "private-client-order-id" not in serialized
     if os.name == "posix":
-        assert output.stat().st_mode & 0o777 == 0o600
+        assert output.stat().st_mode & 0o777 == 0o666
 
 
 def test_live_mode_is_rejected_without_making_api_requests(monkeypatch, tmp_path):

@@ -22,6 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from server.io_utils import ensure_directory
 from server.reconciliation import reconcile_snapshot
 
 
@@ -62,7 +63,7 @@ def _canonical_json(record: dict[str, Any]) -> bytes:
 
 
 def _write_atomic(path: Path, data: bytes, mode: int = 0o600) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_directory(path.parent)
     temp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -100,7 +101,7 @@ class RiskAuditLog:
         self.path = Path(path)
         self.anchor_path = self.path.with_name(f"{self.path.name}.anchor")
         self._lock = threading.Lock()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_directory(self.path.parent)
         self.sequence, self.last_hash = self._verify()
         self._failed = False
 
@@ -796,6 +797,26 @@ class RiskGateClient:
         self.timeout = timeout
         self.max_heartbeat_age = max_heartbeat_age
         self._opener = urllib.request.build_opener(_NoRedirect())
+
+    def configuration_status(self) -> dict[str, Any]:
+        """Describe local credential configuration without contacting the gateway.
+
+        A missing token is a configuration problem, not an operational outage.
+        Callers use this distinction to choose a read-only fallback in non-production
+        PAPER environments instead of a hard halt.
+        """
+        token_configured = len(self.token) >= 32
+        return {
+            "base_url": self.base_url,
+            "token_configured": token_configured,
+            "admin_token_configured": len(self.admin_token) >= 32,
+            "configured": token_configured,
+            "reason": (
+                None
+                if token_configured
+                else "Risk gateway authentication is not configured (RISK_GATE_TOKEN)."
+            ),
+        }
 
     def _request(
         self, method: str, path: str, payload: dict[str, Any] | None = None,

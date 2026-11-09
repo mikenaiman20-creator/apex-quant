@@ -58,10 +58,23 @@ In the GitHub OAuth App settings, set the Authorization callback URL to exactly:
 https://151.145.93.209.nip.io/oauth2/callback
 ```
 
-Update the existing server-side `deploy/phase0/oauth2-proxy.env` with the same redirect URL.
-Retain the existing client ID, secret, and cookie secret; do not copy them to the dashboard
-container or into source control. The Compose configuration explicitly sets `--cookie-secure`,
-the host-only cookie domain, and the HTTPS callback.
+Update the existing server-side `deploy/phase0/oauth2-proxy.env` with the same redirect URL,
+cookie domain, and whitelist. Retain the existing client ID, secret, and cookie secret; do not copy
+them to the dashboard container or into source control. The callback scheme must match the public
+dashboard scheme exactly (`https://` here); mixing `http://` and `https://` causes OAuth state
+failures and browser certificate warnings. Nginx forwards `X-Forwarded-Proto`, `X-Forwarded-Host`,
+and `X-Forwarded-Port`, and oauth2-proxy runs with `--reverse-proxy=true` and a secure cookie.
+
+```sh
+OAUTH2_PROXY_REDIRECT_URL=https://151.145.93.209.nip.io/oauth2/callback
+OAUTH2_PROXY_COOKIE_DOMAIN=151.145.93.209.nip.io
+OAUTH2_PROXY_WHITELIST_DOMAINS=.151.145.93.209.nip.io
+OAUTH2_PROXY_COOKIE_SECURE=true
+```
+
+`nip.io` is a third-party wildcard DNS service. The name resolves to the embedded IP, but its
+certificate and OAuth flow depend on that service and on the same public IP. Use a domain you
+control for long-lived production deployments.
 
 ## 3. Issue a Let's Encrypt certificate
 

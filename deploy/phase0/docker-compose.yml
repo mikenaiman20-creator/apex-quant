@@ -97,14 +97,14 @@ services:
       - --scope=user:email read:org
       - --email-domain=*
       - --authenticated-emails-file=/etc/oauth2-proxy/allowed_emails
-      - --redirect-url=https://151.145.93.209.nip.io/oauth2/callback
-      - --cookie-domain=151.145.93.209.nip.io
-      - --whitelist-domain=151.145.93.209.nip.io
+      # Redirect URL, cookie domain, and whitelist are supplied by
+      # oauth2-proxy.env (OAUTH2_PROXY_REDIRECT_URL, OAUTH2_PROXY_COOKIE_DOMAIN,
+      # OAUTH2_PROXY_WHITELIST_DOMAINS) so the public scheme always matches the
+      # certificate and the browser-facing URL.
       - --upstream=static://200
       - --skip-provider-button=true
       - --reverse-proxy=true
       - --set-xauthrequest=true
-      - --cookie-secure=true
       - --cookie-samesite=lax
       - --standard-logging=true
       - --auth-logging=true

@@ -50,6 +50,16 @@ deliberately updates the allowlist.
 
 ## 2. Start the isolated risk container
 
+Before the first start, correct the shared bind-mount permissions as root. The container entrypoint
+also attempts this, but a host-side run is required when the mount is owned by a different UID:
+
+```bash
+sudo APEX_APP_ROOT=/home/ubuntu/apex_quant \
+  APEX_RUNTIME_UID="${APEX_RUNTIME_UID:-1001}" \
+  APEX_RUNTIME_GID="${APEX_RUNTIME_GID:-1001}" \
+  /home/ubuntu/apex_quant/deploy/bootstrap-permissions.sh
+```
+
 Use the existing Compose project and Phase 0/1 files so this overlay preserves the deployed
 volumes and networks:
 

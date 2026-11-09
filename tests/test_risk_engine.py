@@ -171,6 +171,17 @@ def test_risk_gateway_http_auth_health_and_loopback_requirement(tmp_path):
         thread.join(timeout=2)
 
 
+def test_risk_gate_reports_local_configuration_without_contacting_gateway():
+    missing = RiskGateClient("http://127.0.0.1:18765", "")
+    status = missing.configuration_status()
+    assert status["configured"] is False
+    assert status["token_configured"] is False
+    assert "not configured" in status["reason"].lower()
+
+    configured = RiskGateClient("http://127.0.0.1:18765", GATE_TOKEN)
+    assert configured.configuration_status()["configured"] is True
+
+
 def test_risk_gate_rejects_stale_heartbeat(monkeypatch):
     client = RiskGateClient(
         "http://127.0.0.1:18765", GATE_TOKEN,

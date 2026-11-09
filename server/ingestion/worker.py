@@ -15,6 +15,7 @@ from server.ingestion.filter import (
     GeminiUnavailable, OllamaUnavailable, extract_strategy,
 )
 from server.ingestion.sources import ResearchDocument, SourcesUnavailable, harvest
+from server.io_utils import atomic_write_json
 
 log = logging.getLogger("apex.research.factory")
 DEFAULT_INTERVAL_SECONDS = 180 * 60
@@ -44,26 +45,7 @@ class ResearchIngestionWorker:
         self.state_path = self.root / "logs" / "research_brain_state.json"
 
     def _write_state(self, state: dict) -> None:
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        temp = self.state_path.with_name(
-            f".{self.state_path.name}.{os.getpid()}.{threading.get_ident()}."
-            f"{time.time_ns()}.tmp"
-        )
-        try:
-            temp.write_text(json.dumps(state, indent=2, allow_nan=False), encoding="utf-8")
-            for attempt in range(5):
-                try:
-                    os.replace(temp, self.state_path)
-                    return
-                except OSError:
-                    if attempt == 4:
-                        raise
-                    time.sleep(0.05 * (attempt + 1))
-        finally:
-            try:
-                temp.unlink()
-            except FileNotFoundError:
-                pass
+        atomic_write_json(self.state_path, state, indent=2)
 
     def run_once(self) -> dict:
         started = datetime.now(timezone.utc)

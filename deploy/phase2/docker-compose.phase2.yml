@@ -5,11 +5,13 @@ services:
       dockerfile: deploy/phase2/Dockerfile
       args:
         PYTHON_IMAGE: ${PYTHON_IMAGE:?Set PYTHON_IMAGE to a verified, digest-pinned image}
-    user: "${APEX_RUNTIME_UID:?Set APEX_RUNTIME_UID}:${APEX_RUNTIME_GID:?Set APEX_RUNTIME_GID}"
     restart: unless-stopped
     env_file:
       - ../phase2/risk-gate.env
     environment:
+      APEX_APP_ROOT: /app
+      APEX_RUNTIME_UID: ${APEX_RUNTIME_UID:?Set APEX_RUNTIME_UID}
+      APEX_RUNTIME_GID: ${APEX_RUNTIME_GID:?Set APEX_RUNTIME_GID}
       RISK_ALLOWED_SYMBOLS: ${RISK_ALLOWED_SYMBOLS:-SPY,QQQ,NVDA}
       RISK_MAX_PER_TRADE_PCT: ${RISK_MAX_PER_TRADE_PCT:-0.005}
       RISK_MAX_POSITION_NOTIONAL_PCT: ${RISK_MAX_POSITION_NOTIONAL_PCT:-0.20}

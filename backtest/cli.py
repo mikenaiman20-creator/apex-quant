@@ -13,7 +13,10 @@ import logging
 import sys
 from dataclasses import replace
 from datetime import datetime, timezone
+from pathlib import Path
 from uuid import uuid4
+
+from server.io_utils import ensure_directory, secure_file
 
 from backtest.cpcv import evaluate_cpcv
 from backtest.data import data_quality, fetch_alpaca, load_dir, save_csv, synthetic_bars
@@ -169,7 +172,11 @@ def cmd_run(a) -> int:
         print("The strategy only has an edge if it beats the null model, not merely if it is positive.")
 
         if a.out:
-            with open(a.out, "w", newline="") as f:
+            out_path = Path(a.out)
+            if str(out_path.parent) not in {"", "."}:
+                ensure_directory(out_path.parent)
+            with out_path.open("w", newline="") as f:
+                secure_file(out_path)
                 w = csv.writer(f)
                 w.writerow(["symbol", "side", "entry_ts", "exit_ts", "entry", "exit", "qty", "stop", "gross", "costs",
                             "net", "R", "reason", "score", "rationale"])

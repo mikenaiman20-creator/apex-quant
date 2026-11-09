@@ -9,7 +9,8 @@ User=ubuntu
 WorkingDirectory=/home/ubuntu/apex_quant
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONUNBUFFERED=1
-UMask=0077
+UMask=0002
+ExecStartPre=+/home/ubuntu/apex_quant/deploy/bootstrap-permissions.sh
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/home/ubuntu/apex_quant/logs

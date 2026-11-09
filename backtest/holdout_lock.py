@@ -21,6 +21,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from server.io_utils import atomic_write_json
+
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DIR = ROOT / "data" / "final_holdout"
 DEFAULT_LOCK_PATH = ROOT / "config" / "holdout.lock.json"
@@ -96,11 +98,7 @@ def read_lock(path: Path = DEFAULT_LOCK_PATH) -> dict[str, Any]:
 
 
 def write_lock(manifest: dict[str, Any], path: Path = DEFAULT_LOCK_PATH) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    temp.replace(path)
+    atomic_write_json(Path(path), manifest, indent=2)
 
 
 def build_manifest(directory: Path, symbols: Sequence[str]) -> dict[str, Any]:
