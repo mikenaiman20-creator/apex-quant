@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "algorithm": "sha256(canonical-json-v1: sorted filename + per-file sha256 + bytes)",
+  "status": "pending",
+  "locked_at": null,
+  "symbols": [],
+  "dataset_id": null,
+  "files": {}
+}

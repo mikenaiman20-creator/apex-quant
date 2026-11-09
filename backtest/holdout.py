@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import math
-import hashlib
 import json
 import logging
 from pathlib import Path
@@ -10,6 +9,7 @@ from typing import Any
 
 from backtest.data import load_dir
 from backtest.engine import BTConfig, SignalFn, run_backtest
+from backtest.holdout_lock import canonical_symbols, fingerprint_directory
 from backtest.metrics import summarize, trade_equity_curve
 from backtest.walkforward import apply_params
 
@@ -28,9 +28,17 @@ def validate_final_holdout(
     signal_fn: SignalFn | None = None,
 ) -> dict[str, Any]:
     """Load the isolated holdout only after parameters are frozen; never tune on its results."""
+    if not symbols:
+        return {
+            "available": False,
+            "passed": False,
+            "reason": "final holdout data unavailable; provide untouched CSVs in data/final_holdout",
+            "missing_files": [],
+        }
+    symbols = canonical_symbols(symbols)
     expected_files = [directory / f"{symbol}.csv" for symbol in symbols]
     missing = [str(path) for path in expected_files if not path.is_file()]
-    if not symbols or missing:
+    if missing:
         return {
             "available": False,
             "passed": False,
@@ -42,13 +50,8 @@ def validate_final_holdout(
         if directory.resolve() == FINAL_HOLDOUT_DIR.resolve()
         else directory.parent / "logs" / "final_holdout_consumption.json"
     )
-    digest = hashlib.sha256()
     try:
-        for path in expected_files:
-            digest.update(path.name.encode("utf-8"))
-            with path.open("rb") as file:
-                for chunk in iter(lambda: file.read(1024 * 1024), b""):
-                    digest.update(chunk)
+        dataset_id = fingerprint_directory(directory, symbols)["dataset_id"]
     except OSError as exc:
         return {
             "available": False,
@@ -56,7 +59,6 @@ def validate_final_holdout(
             "reason": f"final holdout data could not be fingerprinted: {exc}",
             "missing_files": [],
         }
-    dataset_id = digest.hexdigest()
     try:
         ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
     except FileNotFoundError:

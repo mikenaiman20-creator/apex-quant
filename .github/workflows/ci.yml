@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  PYTHONUNBUFFERED: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  verify:
+    name: Verify (ARM64, Python ${{ matrix.python-version }})
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.13"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Repository hygiene (no bytecode, secrets, or holdout data)
+        shell: bash
+        run: |
+          set -euo pipefail
+          tracked="$(git ls-files)"
+          if grep -Eq '(^|/)__pycache__/|\.pyc$' <<<"$tracked"; then
+            echo "::error::Tracked Python bytecode found. Remove it from git."
+            grep -E '(^|/)__pycache__/|\.pyc$' <<<"$tracked" | head -20
+            exit 1
+          fi
+          if grep -Eq '(^|/)\.env$' <<<"$tracked"; then
+            echo "::error::A .env file is tracked. Remove it and rotate any secrets."
+            exit 1
+          fi
+          if git ls-files --error-unmatch data/final_holdout >/dev/null 2>&1; then
+            echo "::error::Final holdout data must never be committed."
+            exit 1
+          fi
+
+      - name: Whitespace check
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if [ -n "${base}" ] && git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            git diff --check "${base}" HEAD
+          else
+            git diff --check HEAD
+          fi
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+          python -m pip check
+
+      - name: Compile all modules
+        shell: bash
+        run: |
+          python - <<'PY'
+          import pathlib
+          import sys
+
+          failures = []
+          for path in sorted(pathlib.Path(".").rglob("*.py")):
+              if ".git" in path.parts:
+                  continue
+              try:
+                  compile(path.read_text(encoding="utf-8"), str(path), "exec")
+              except (SyntaxError, UnicodeDecodeError) as exc:
+                  failures.append(f"{path}: {exc}")
+          if failures:
+              print("\n".join(failures), file=sys.stderr)
+              raise SystemExit(1)
+          print("Compiled all Python sources")
+          PY
+
+      - name: Verify SHA-256 holdout lock
+        run: python -m backtest.holdout_lock verify
+
+      - name: Run test suite
+        run: python -m pytest -q --disable-warnings
+
+      - name: Fail-closed gate smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from backtest.cpcv import generate_synthetic_calibration_signal
+          from backtest.metrics import deflated_sharpe_from_returns
+
+          calibration = generate_synthetic_calibration_signal(observations=30_000)
+          result = deflated_sharpe_from_returns(calibration.net_returns, n_trials=1)
+          if not result.get("passed"):
+              raise SystemExit("Synthetic calibration signal no longer clears DSR")
+          print(f"Calibration DSR probability={result['adjusted_sharpe']:.3f}")
+          PY

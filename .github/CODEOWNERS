@@ -1,0 +1,6 @@
+# Changing the holdout lock or its verifier requires owner review. This only
+# prevents silent peeking if branch protection requires code-owner review.
+config/holdout.lock.json @mikenaiman20-creator
+backtest/holdout_lock.py @mikenaiman20-creator
+backtest/holdout.py @mikenaiman20-creator
+.github/workflows/ci.yml @mikenaiman20-creator

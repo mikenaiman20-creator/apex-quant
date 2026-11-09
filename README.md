@@ -355,5 +355,29 @@ validated paper results before relying on promotion status.
 The watchdog diagnoses and logs component exceptions and retries failed components with
 exponential backoff. It deliberately does not edit source files, modify risk controls, or roll back
 the workspace automatically: runtime self-patching and destructive Git rollback are disabled.
-#   a p e x - q u a n t  
- 
+
+## CI and the SHA-256 holdout lock
+
+GitHub Actions runs the full suite on a native ARM64 runner (`ubuntu-24.04-arm`) for every pull
+request and every push to `main` (`.github/workflows/ci.yml`). Beyond the tests, the job fails on
+tracked bytecode, secrets, or holdout data, whitespace errors, uncompilable modules, and a
+fail-closed calibration smoke test that re-proves the synthetic signal clears DSR.
+
+The blind holdout is never committed. `config/holdout.lock.json` records the canonical SHA-256
+fingerprint of the frozen `data/final_holdout/*.csv` snapshot: a per-file digest plus byte count,
+hashed in sorted filename order so symbol order cannot change the dataset id. That id is also the
+key in `logs/final_holdout_consumption.json`, so reordering symbols cannot consume a dataset twice.
+
+On the host that holds the private data, freeze and verify the snapshot with:
+
+```sh
+python -m backtest.holdout_lock record --dir data/final_holdout
+python -m backtest.holdout_lock verify --require-locked
+```
+
+`record` is run once by the person who froze the data, and the resulting lock file is committed for
+review. CI runs `python -m backtest.holdout_lock verify` on every change: it passes when no
+holdout files are checked out (private data is not present in CI), but if any `*.csv` appear they
+must match the committed lock byte-for-byte or the build fails. A `pending` lock plus any holdout
+file also fails, so an unrecorded dataset can never be silently evaluated. Until the lock is
+`locked`, candidate staging continues to fail closed.
