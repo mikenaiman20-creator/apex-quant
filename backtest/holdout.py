@@ -9,7 +9,12 @@ from typing import Any
 
 from backtest.data import load_dir
 from backtest.engine import BTConfig, SignalFn, run_backtest
-from backtest.holdout_lock import canonical_symbols, fingerprint_directory
+from backtest.holdout_lock import (
+    DEFAULT_LOCK_PATH as DEFAULT_HOLDOUT_LOCK,
+    canonical_symbols,
+    fingerprint_directory,
+    verify as verify_holdout_lock,
+)
 from backtest.metrics import summarize, trade_equity_curve
 from backtest.walkforward import apply_params
 
@@ -26,6 +31,8 @@ def validate_final_holdout(
     directory: Path = FINAL_HOLDOUT_DIR,
     ledger_path: Path | None = None,
     signal_fn: SignalFn | None = None,
+    lock_path: Path | None = None,
+    require_lock: bool | None = None,
 ) -> dict[str, Any]:
     """Load the isolated holdout only after parameters are frozen; never tune on its results."""
     if not symbols:
@@ -45,6 +52,21 @@ def validate_final_holdout(
             "reason": "final holdout data unavailable; provide untouched CSVs in data/final_holdout",
             "missing_files": missing,
         }
+    if require_lock is None:
+        require_lock = directory.resolve() == FINAL_HOLDOUT_DIR.resolve()
+    if require_lock:
+        lock_result = verify_holdout_lock(
+            directory,
+            lock_path or DEFAULT_HOLDOUT_LOCK,
+            require_locked=True,
+        )
+        if not lock_result["ok"]:
+            return {
+                "available": False,
+                "passed": False,
+                "reason": "final holdout lock rejected: " + lock_result["reason"],
+                "missing_files": [],
+            }
     ledger_path = ledger_path or (
         ROOT / "logs" / "final_holdout_consumption.json"
         if directory.resolve() == FINAL_HOLDOUT_DIR.resolve()

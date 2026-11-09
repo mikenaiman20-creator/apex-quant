@@ -119,10 +119,7 @@ def test_dataset_id_is_independent_of_symbol_order(tmp_path: Path):
     assert forward["files"] == reverse["files"]
 
 
-def test_holdout_consumption_is_order_independent(tmp_path: Path, monkeypatch):
-    directory = tmp_path / "final_holdout"
-    _write_holdout(directory, "QQQ", "qqq")
-    _write_holdout(directory, "SPY", "spy")
+def _stub_backtest(monkeypatch) -> None:
     monkeypatch.setattr(
         holdout_module, "load_dir", lambda *_args: {"SPY": [object()], "QQQ": [object()]}
     )
@@ -144,6 +141,13 @@ def test_holdout_consumption_is_order_independent(tmp_path: Path, monkeypatch):
             "max_dd_pct": 4.0, "mean_r": 0.1,
         },
     )
+
+
+def test_holdout_consumption_is_order_independent(tmp_path: Path, monkeypatch):
+    directory = tmp_path / "final_holdout"
+    _write_holdout(directory, "QQQ", "qqq")
+    _write_holdout(directory, "SPY", "spy")
+    _stub_backtest(monkeypatch)
     ledger = tmp_path / "consumption.json"
 
     first = holdout_module.validate_final_holdout(
@@ -156,6 +160,35 @@ def test_holdout_consumption_is_order_independent(tmp_path: Path, monkeypatch):
     assert first["passed"] is True
     assert reordered["passed"] is False
     assert "already consumed" in reordered["reason"]
+
+
+def test_holdout_runtime_rejects_unlocked_or_tampered_data(tmp_path: Path, monkeypatch):
+    directory = tmp_path / "final_holdout"
+    path = _write_holdout(directory)
+    lock_path = tmp_path / "lock.json"
+    write_lock(pending_manifest(), lock_path)
+    _stub_backtest(monkeypatch)
+
+    def run(candidate: str, ledger: Path):
+        return holdout_module.validate_final_holdout(
+            ["SPY"], BTConfig(), {}, candidate, directory, ledger,
+            lock_path=lock_path, require_lock=True,
+        )
+
+    pending = run("candidate-a", tmp_path / "a.json")
+    assert pending["available"] is False
+    assert "lock rejected" in pending["reason"]
+    assert "no locked fingerprint" in pending["reason"]
+
+    write_lock(build_manifest(directory, ["SPY"]), lock_path)
+    passed = run("candidate-a", tmp_path / "b.json")
+    assert passed["passed"] is True
+
+    path.write_text("tampered", encoding="utf-8")
+    tampered = run("candidate-b", tmp_path / "c.json")
+    assert tampered["available"] is False
+    assert "lock rejected" in tampered["reason"]
+    assert "SPY.csv" in tampered["reason"]
 
 
 def test_cli_record_and_verify_exit_codes(tmp_path: Path, capsys):

@@ -379,5 +379,6 @@ python -m backtest.holdout_lock verify --require-locked
 review. CI runs `python -m backtest.holdout_lock verify` on every change: it passes when no
 holdout files are checked out (private data is not present in CI), but if any `*.csv` appear they
 must match the committed lock byte-for-byte or the build fails. A `pending` lock plus any holdout
-file also fails, so an unrecorded dataset can never be silently evaluated. Until the lock is
-`locked`, candidate staging continues to fail closed.
+file also fails, so an unrecorded dataset can never be silently evaluated. The production holdout
+validator itself also requires a `locked`, matching manifest before it will run a candidate; until
+the lock is `locked`, candidate staging continues to fail closed.
