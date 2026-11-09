@@ -3,6 +3,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from engine.data_pipeline import Bar
 from server.evolution import (
     ArsenalEvolution, approve_candidate, deflated_sharpe, evolve_arsenal,
@@ -304,6 +306,31 @@ def test_trial_ledger_is_cumulative_and_deduplicates_cycles(tmp_path: Path):
     assert register_trials("cycle-a", 16, ledger) == 16
     assert register_trials("cycle-a", 16, ledger) == 16
     assert register_trials("cycle-b", 16, ledger) == 32
+    persisted = json.loads(ledger.read_text(encoding="utf-8"))
+    assert persisted["num_trials"] == 32
+    assert persisted["total_trials"] == 32
+
+
+def test_trial_counter_persists_failed_and_historical_sweeps(tmp_path: Path):
+    ledger = tmp_path / "logs" / "trial-ledger.json"
+    assert register_trials("sweep-before-failure", 4, ledger) == 4
+    assert register_trials("later-sweep", 7, ledger) == 11
+    assert register_trials("later-sweep", 7, ledger) == 11
+    restored = json.loads(ledger.read_text(encoding="utf-8"))
+    assert restored["cycles"] == {
+        "sweep-before-failure": 4,
+        "later-sweep": 7,
+    }
+    assert restored["num_trials"] == 11
+
+
+def test_trial_registration_fails_closed_on_corrupt_history(tmp_path: Path):
+    ledger = tmp_path / "trial-ledger.json"
+    original = "{ invalid json"
+    ledger.write_text(original, encoding="utf-8")
+    with pytest.raises(ValueError, match="refusing to reset trial history"):
+        register_trials("new-cycle", 16, ledger)
+    assert ledger.read_text(encoding="utf-8") == original
 
 
 def test_trial_ledger_retains_only_142_unique_walk_forward_win_rate_samples(tmp_path: Path):
@@ -333,6 +360,19 @@ def test_candidate_requires_holdout_before_staging_and_human_approval(tmp_path: 
         "profit_factor": 2.0,
         "max_drawdown_pct": 3.0,
         "n_trials": 1,
+        "cpcv": {
+            "method": "CPCV-CSCV",
+            "pbo": 0.1,
+            "pbo_passed": True,
+            "valid_splits": 20,
+            "n_trials": 1,
+            "dsr": {
+                "raw_sharpe": 5.0,
+                "observations": 300,
+                "skewness": 0.0,
+                "kurtosis": 3.0,
+            },
+        },
         "params": {"min_signal_score": 0.75},
         "forward_paper_expectancy_r": None,
     }
@@ -350,6 +390,8 @@ def test_candidate_requires_holdout_before_staging_and_human_approval(tmp_path: 
         audit_path, staging_dir,
     )
     assert staged["status"] == "staged_candidate"
+    assert staged["cpcv_gate_passed"] is True
+    assert staged["pbo"] == 0.1
     assert (staging_dir / "candidate-2026-01.json").exists()
     active = tmp_path / "active.json"
     approved = approve_candidate(
@@ -358,6 +400,27 @@ def test_candidate_requires_holdout_before_staging_and_human_approval(tmp_path: 
     assert approved["human_approved"] is True
     assert approved["status"] == "approved_for_paper"
     assert json.loads(active.read_text())["candidate_id"] == "candidate-2026-01"
+
+
+def test_candidate_without_cpcv_evidence_cannot_be_staged(tmp_path: Path):
+    candidate = {
+        "id": "missing-cpcv",
+        "sharpe": 5.0,
+        "observations": 300,
+        "paper_trades": 40,
+        "profit_factor": 2.0,
+        "max_drawdown_pct": 3.0,
+        "n_trials": 1,
+    }
+    audit = stage_candidate(
+        candidate,
+        {"available": True, "passed": True, "reason": "passed"},
+        tmp_path / "audit.json",
+        tmp_path / "staging",
+    )
+    assert audit["status"] == "blocked"
+    assert audit["cpcv_gate_passed"] is False
+    assert not (tmp_path / "staging" / "missing-cpcv.json").exists()
 
 
 def test_final_holdout_is_consumed_once_per_dataset(tmp_path: Path, monkeypatch):

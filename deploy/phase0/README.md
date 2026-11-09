@@ -3,12 +3,18 @@
 > The self-signed IP/TLS instructions below are superseded for the current host by the Phase 1
 > Let's Encrypt and DNS deployment in [`../phase1/README.md`](../phase1/README.md).
 
-This deployment publishes only Nginx on ports 80/443. Streamlit has no host port mapping.
+This deployment publishes only Nginx on ports 80/443. Streamlit and Ollama have no host port
+mapping. Ollama runs on a separate internal-only network shared only with Streamlit, and is
+limited to one CPU and 3 GiB of memory. Its model volume persists across container restarts.
 ChromaDB is an opt-in Compose profile attached to a separate, internal-only Docker network with
 no other containers attached and no host port mapping. Do not connect application containers to
 ChromaDB until its version/runtime has a verified mitigation for the cited issue. Nginx and
 OAuth2 Proxy join `apex-internal`; OAuth2 Proxy additionally needs outbound access to GitHub on
 `apex-egress` to complete OAuth. Neither container publishes a host port.
+The current OCI Docker Snap runtime returns `operation not permitted` when containers use
+`no-new-privileges:true`, so this deployment omits that option. Validate runtime support before
+reintroducing it; Streamlit still uses a read-only filesystem, a non-root UID, and dropped
+capabilities.
 
 The CVE-2026-45829 record currently describes affected ChromaDB versions as 1.0.0 and later. Its
 referenced report says the Python backend can execute an untrusted embedding model before the
@@ -45,6 +51,9 @@ CHROMA_IMAGE=chromadb/chroma@sha256:<verified-digest>
 NGINX_IMAGE=nginx@sha256:<verified-digest>
 OAUTH2_PROXY_IMAGE=quay.io/oauth2-proxy/oauth2-proxy@sha256:<verified-digest>
 PYTHON_IMAGE=python:3.11-slim@sha256:<verified-digest>
+APEX_UI_OLLAMA_URL=http://ollama:11434
+APEX_UI_OLLAMA_MODEL=qwen2.5-coder:1.5b
+OLLAMA_IMAGE=ollama/ollama@sha256:55d6d58fce77338d8b626abbbbec63b79deeb24db3fd67b8a99951a84083552f
 ```
 
 The example digests are intentionally invalid. Replace each value with an actual registry digest.
@@ -83,17 +92,41 @@ Allow TCP/80 and TCP/443 in OCI ingress as needed. Keep TCP/22 restricted to the
 
 ```bash
 cd /home/ubuntu/apex_quant
-docker compose --env-file deploy/phase0/deployment.env \
+docker network inspect apex-internal >/dev/null 2>&1 || \
+  docker network create --internal apex-internal
+test "$(docker network inspect apex-internal --format '{{.Internal}}')" = true
+docker compose -p apex-project --env-file deploy/phase0/deployment.env \
   -f deploy/phase0/docker-compose.yml config
-docker compose --env-file deploy/phase0/deployment.env \
+docker compose -p apex-project --env-file deploy/phase0/deployment.env \
   -f deploy/phase0/docker-compose.yml up --build -d
-docker compose --env-file deploy/phase0/deployment.env \
+docker compose -p apex-project --env-file deploy/phase0/deployment.env \
   -f deploy/phase0/docker-compose.yml ps
 docker network inspect apex-internal
 ```
 
-`app.py` is bind-mounted read-only so an updated dashboard script is picked up by Streamlit's
-file watcher; changing Python dependencies still requires rebuilding the image. The root
+`app.py` is bind-mounted read-only. Recreate Streamlit after replacing the host file so the
+container does not retain a stale bind-mounted inode. Changing Python dependencies still
+requires rebuilding the image. Download the local RAG model and then remove Ollama's temporary
+egress attachment:
+
+```bash
+docker compose -p apex-project --env-file deploy/phase0/deployment.env \
+  -f deploy/phase0/docker-compose.yml -f deploy/phase1/docker-compose.phase1.yml \
+  -f deploy/phase2/docker-compose.phase2.yml up -d ollama streamlit
+docker network connect apex-egress apex-project-ollama-1
+docker exec apex-project-ollama-1 ollama pull qwen2.5-coder:1.5b
+docker network disconnect apex-egress apex-project-ollama-1
+docker exec apex-project-ollama-1 ollama list
+docker inspect apex-project-ollama-1 --format '{{json .NetworkSettings.Ports}}'
+docker network inspect apex-llm-internal
+```
+
+The temporary egress attachment is only for model download. Keep it disconnected afterward.
+The RAG UI uses only the local Ollama model and requires no paid API credentials. Setting
+`CRYPTO_SYMBOLS=BTC/USD,ETH/USD` enables public market-data research for the two dashboard
+widgets; crypto order routing remains disabled.
+
+The root
 `.dockerignore` restricts the image build context to the dashboard and its dependency manifest.
 
 `docker network inspect apex-internal` must report `"Internal": true`. To start Chroma only after
@@ -130,7 +163,7 @@ Verify that Streamlit and ChromaDB are not reachable from outside the VM:
 ```bash
 sudo ss -lntp | grep -E ':(8501|8000)\b' && echo "Unexpected published service port" && exit 1 || true
 docker port chromadb
-docker port "$(docker compose --env-file deploy/phase0/deployment.env \
+docker port "$(docker compose -p apex-project --env-file deploy/phase0/deployment.env \
   -f deploy/phase0/docker-compose.yml ps -q streamlit)"
 ```
 

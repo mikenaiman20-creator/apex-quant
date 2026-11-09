@@ -1,0 +1,17 @@
+[Unit]
+Description=Refresh sanitized Apex Quant PAPER account telemetry
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/apex_quant
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/apex_quant/logs
+PrivateTmp=true
+ExecStart=/home/ubuntu/miniforge3/envs/apex_env/bin/python -m server.paper_snapshot --env-file /home/ubuntu/apex_quant/.env --output /home/ubuntu/apex_quant/logs/paper_dashboard_snapshot.json

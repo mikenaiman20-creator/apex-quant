@@ -1,0 +1,20 @@
+[Unit]
+Description=Read-only Apex Quant Alpaca balance and position reconciliation
+Requires=apex-risk-gateway-proxy.socket
+After=network-online.target apex-risk-gateway-proxy.socket
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/apex_quant
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ExecStart=/home/ubuntu/miniforge3/envs/apex_env/bin/python -m server.reconciliation
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=30

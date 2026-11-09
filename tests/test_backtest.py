@@ -8,6 +8,9 @@ import pytest
 from backtest.data import NY, MinuteBar, data_quality, normalize, synthetic_bars
 from backtest.engine import BTConfig, run_backtest
 from backtest.metrics import bootstrap_ci, summarize, trade_equity_curve
+from backtest.strategies import opening_range_breakout
+from backtest.strategies import short_term_zscore_mean_reversion
+from backtest.walkforward import run_parameter_grid
 from config.settings import RiskLimits
 from engine.data_pipeline import SymbolState, Trade
 from engine.strategy import Decision, Side
@@ -29,9 +32,28 @@ def day_bars(d=DAY, price=lambda i: 100.0, overrides=None, vol=1000.0):
     return out
 
 
+def orb_day_bars(day, breakout=None, breakout_volume=1000.0, regular_range=0.04):
+    base = datetime.combine(day, time(9, 30), tzinfo=NY)
+    bars = []
+    for index in range(390):
+        ts = (base + timedelta(minutes=index)).astimezone(timezone.utc)
+        if index < 15:
+            o, h, l, c, volume = 100.0, 100.1, 99.9, 100.0, 1000.0
+        elif index == 20 and breakout is not None:
+            o, h, l, c = breakout
+            volume = breakout_volume
+        else:
+            half_range = regular_range / 2
+            o, h, l, c, volume = (
+                100.0, 100.0 + half_range, 100.0 - half_range, 100.0, 1000.0,
+            )
+        bars.append(MinuteBar(ts, o, h, l, c, volume))
+    return bars
+
+
 def cfg(**kw):
     base = dict(initial_equity=5000.0, warmup_days=0, entry_start=time(9, 30), slippage_bps=1.0,
-                commission_per_share=0.0035, commission_min=0.35,
+                spread_bps=0.0, commission_per_share=0.0035, commission_min=0.35,
                 risk=RiskLimits(risk_per_trade_pct=0.01, max_position_notional_pct=1.0))
     base.update(kw)
     return BTConfig(**base)
@@ -62,6 +84,77 @@ def test_fill_at_next_open_plus_slippage_and_eod_flat():
     assert t.pnl_net < 0
     assert t.pnl_net == pytest.approx(t.pnl_gross - t.costs)
     assert t.slippage_cost > 0
+
+
+def test_backtester_applies_explicit_bid_ask_spread_to_each_fill():
+    bars = day_bars(overrides={1: (101, 101, 101, 101)})
+    result = run_backtest({"X": bars}, cfg(spread_bps=4.0), long_once(99.0))
+
+    assert result.trades[0].entry == pytest.approx(101 * (1 + 3e-4))
+    assert result.trades[0].exit == pytest.approx(100 * (1 - 3e-4))
+
+
+def test_backtester_flattens_at_last_session_bar_even_if_eod_bar_is_missing():
+    first = day_bars()[:385]
+    second = day_bars(d=DAY + timedelta(days=1))
+    fired = False
+
+    def signal(st, _equity):
+        nonlocal fired
+        if (
+            not fired
+            and st.agg.bars["1m"][-1].start.astimezone(NY).time() == time(15, 53)
+        ):
+            fired = True
+            return Decision(st.symbol, Side.LONG, 1.0, True, [], 100, 90, 120, 1)
+        return None
+
+    result = run_backtest(
+        {"SPY": first + second}, cfg(entry_end=time(15, 54)), signal,
+    )
+
+    assert len(result.trades) == 1
+    assert result.trades[0].exit_reason == "eod"
+    assert result.trades[0].exit_ts.date() == first[-1].ts.date()
+
+
+def _zscore_states(*, panic=False):
+    spy, qqq = SymbolState("SPY"), SymbolState("QQQ")
+    qqq.market_state = spy
+    base = datetime.combine(date(2025, 3, 3), time(9, 30), tzinfo=NY)
+    for index in range(81):
+        ts = base + timedelta(minutes=index)
+        if panic and index >= 61:
+            spy_price = 100.0 - (index - 60) * 0.09
+        else:
+            spy_price = 100.0 + (0.02 if index % 2 else 0.0)
+        spy.on_trade(Trade(ts, "SPY", spy_price, 1000, 1))
+
+        if index < 61:
+            qqq_price = 100.0
+        elif index < 80:
+            qqq_price = 99.8 if index % 2 else 100.2
+        else:
+            qqq_price = 99.4
+        qqq.on_trade(Trade(ts, "QQQ", qqq_price, 1000, 1))
+    return spy, qqq
+
+
+def test_zscore_mean_reversion_fades_extreme_and_targets_rolling_mean():
+    _, qqq = _zscore_states()
+    decision = short_term_zscore_mean_reversion(qqq, 5000)
+
+    assert decision is not None
+    assert decision.side is Side.LONG
+    assert decision.target > decision.entry
+    assert decision.stop < decision.entry
+    assert any(check.name == "spy_market_regime" for check in decision.checks)
+
+
+def test_zscore_mean_reversion_blocks_spy_panic_regime():
+    _, qqq = _zscore_states(panic=True)
+
+    assert short_term_zscore_mean_reversion(qqq, 5000) is None
 
 
 def test_stop_beats_target_when_bar_touches_both():
@@ -126,6 +219,151 @@ def test_signal_sees_only_the_past():
     ordered = [b.c for b in bars]
     # at evaluation k the state must reflect exactly bar k's close, never bar k+1's
     assert all(abs(s - c) < 1e-9 for s, c in zip(seen, ordered))
+
+
+@pytest.mark.parametrize(
+    ("side", "breakout"),
+    [
+        ("BUY", (100.05, 100.40, 99.95, 100.20)),
+        ("SHORT", (100.05, 100.10, 99.60, 99.80)),
+    ],
+)
+def test_opening_range_breakout_applies_volume_and_atr_gates(side, breakout):
+    bars = []
+    first_day = date(2025, 1, 6)
+    trading_days = []
+    day = first_day
+    while len(trading_days) < 11:
+        if day.weekday() < 5:
+            trading_days.append(day)
+        day += timedelta(days=1)
+    for day_index, current_day in enumerate(trading_days):
+        day_data = orb_day_bars(
+            current_day,
+            breakout if day_index == len(trading_days) - 1 else None,
+            breakout_volume=2000.0,
+        )
+        bars.extend(day_data)
+    result = run_backtest({"SPY": bars}, cfg(), opening_range_breakout)
+
+    assert len(result.trades) == 1
+    assert result.trades[0].side == side
+    assert result.trades[0].entry_ts.astimezone(NY).date() == trading_days[-1]
+    assert result.trades[0].entry_ts.astimezone(NY).time() == time(9, 51)
+    assert result.trades[0].rationale.startswith("SPY")
+    assert "prior 20-bar average" in result.trades[0].rationale
+    assert "10-session same-time average" in result.trades[0].rationale
+    assert result.trades[0].rationale.startswith("SPY")
+
+
+def test_opening_range_rejects_breakout_below_relative_volume_threshold():
+    bars = []
+    first_day = date(2025, 1, 6)
+    trading_days = []
+    day = first_day
+    while len(trading_days) < 11:
+        if day.weekday() < 5:
+            trading_days.append(day)
+        day += timedelta(days=1)
+    for day_index, current_day in enumerate(trading_days):
+        day_data = orb_day_bars(
+            current_day,
+            (100.05, 100.40, 99.95, 100.20)
+            if day_index == len(trading_days) - 1 else None,
+        )
+        bars.extend(day_data)
+
+    result = run_backtest({"SPY": bars}, cfg(), opening_range_breakout)
+
+    assert result.trades == []
+
+
+def test_parameter_grid_passes_custom_signal_to_each_backtest():
+    bars = day_bars(price=lambda i: 100.0 if i < 15 else 101.0)
+    results = run_parameter_grid(
+        {"SPY": bars},
+        cfg(),
+        grid={"min_reward_risk": [2.0]},
+        workers=1,
+        signal_fn=long_once(99.0),
+    )
+
+    assert len(results[(2.0,)]) == 1
+
+
+def test_parameter_grid_reserves_trial_count_before_failed_replays(tmp_path, monkeypatch):
+    import json
+
+    import backtest.walkforward as walkforward
+
+    ledger_path = tmp_path / "logs" / "trial-ledger.json"
+
+    def failed_replay(_job):
+        raise RuntimeError("synthetic replay failure")
+
+    monkeypatch.setattr(walkforward, "_run", failed_replay)
+    with pytest.raises(RuntimeError, match="synthetic replay failure"):
+        run_parameter_grid(
+            {"SPY": day_bars()},
+            cfg(),
+            grid={"min_signal_score": [0.65, 0.75]},
+            workers=1,
+            trial_cycle_id="failed-sweep",
+            trial_ledger_path=ledger_path,
+        )
+
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert ledger["num_trials"] == 2
+    assert ledger["total_trials"] == 2
+    assert ledger["cycles"]["failed-sweep"] == 2
+
+
+def test_opening_range_rejects_breakout_below_intraday_atr_regime():
+    bars = []
+    first_day = date(2025, 1, 6)
+    trading_days = []
+    day = first_day
+    while len(trading_days) < 11:
+        if day.weekday() < 5:
+            trading_days.append(day)
+        day += timedelta(days=1)
+    for day_index, current_day in enumerate(trading_days):
+        bars.extend(orb_day_bars(
+            current_day,
+            (100.05, 100.40, 99.95, 100.20)
+            if day_index == len(trading_days) - 1 else None,
+            breakout_volume=2000.0,
+            regular_range=0.04 if day_index == len(trading_days) - 1 else 0.4,
+        ))
+
+    result = run_backtest({"SPY": bars}, cfg(), opening_range_breakout)
+
+    assert result.trades == []
+
+
+def test_opening_range_width_trailing_stop_tightens_after_one_r():
+    bars = day_bars(overrides={
+        1: (100, 100, 100, 100),
+        2: (100, 102, 100, 102),
+        3: (102, 103, 101.4, 102),
+    })
+
+    def signal(st, _equity):
+        if st.last_price == 100:
+            return Decision(
+                st.symbol, Side.LONG, 1.0, True, [], 100, 99, 120, 1,
+                trail_distance=0.5,
+            )
+        return None
+
+    trade = run_backtest(
+        {"SPY": bars},
+        cfg(risk=replace(cfg().risk, min_reward_risk=10.0)),
+        signal,
+    ).trades[0]
+
+    assert trade.exit_reason == "stop"
+    assert trade.exit == pytest.approx(101.5 * (1 - 1e-4))
 
 
 def test_session_vwap_resets_and_daily_close_banked():

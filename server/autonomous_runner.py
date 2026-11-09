@@ -7,7 +7,6 @@ import hashlib
 import json
 import logging
 import math
-import msvcrt
 import os
 import random
 import re
@@ -17,6 +16,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -27,7 +27,13 @@ from statistics import median
 from typing import Any
 from zoneinfo import ZoneInfo
 
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
 from backtest.data import MinuteBar, data_quality, normalize
+from backtest.cpcv import evaluate_cpcv
 from backtest.engine import BTConfig
 from backtest.holdout import validate_final_holdout
 from backtest.metrics import summarize, trade_equity_curve
@@ -35,12 +41,13 @@ from backtest.walkforward import apply_params, walk_forward
 from config.settings import (
     BrokerName, Settings, TradingMode, load_project_env, load_settings,
 )
-from engine.data_pipeline import Quote, SymbolState, Trade, atr
+from engine.data_pipeline import Quote, SymbolState, Trade, atr, bbwp
 from engine.strategy import (
-    AlphaEngine, MultiTimeframeFilter, RiskEngine, Side,
+    AlphaEngine, MultiTimeframeFilter, RiskEngine, Side, simple_moving_average,
 )
 from server.broker_adapters import AlpacaPaperAdapter, BaseBrokerAdapter
 from server.ingestion.brain import KnowledgeBrain
+from server.risk_engine import RiskGateClient, RiskGateRejected, RiskGateUnavailable
 from server.universe import DynamicUniverseSelector
 from server.event_guard import GuardDecision, MacroEventGuard
 from server.evolution import register_trials, stage_candidate
@@ -151,6 +158,56 @@ def write_dashboard_paper_snapshot(
         os.replace(temp_path, path)
     except (OSError, TypeError, ValueError):
         log.exception("Unable to publish paper account snapshot for the read-only dashboard.")
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def write_dashboard_market_snapshot(market: dict[str, dict[str, Any]]) -> None:
+    """Atomically publish sanitized quote, candle, and indicator data for the read-only UI."""
+    allowed_fields = {
+        "asset_class", "display_symbol", "price", "bid", "ask", "timestamp",
+        "trend_50d", "sma50", "atr", "atr_pct", "bbwp", "regime", "candles",
+    }
+    clean_market = {}
+    for symbol, values in market.items():
+        if not isinstance(symbol, str) or not isinstance(values, dict):
+            continue
+        clean = {
+            key: value for key, value in values.items()
+            if key in allowed_fields and isinstance(value, (str, int, float, list))
+            and not isinstance(value, bool)
+        }
+        candles = clean.get("candles")
+        clean["candles"] = [
+            {"time": candle["time"], "close": candle["close"]}
+            for candle in (candles if isinstance(candles, list) else [])
+            if isinstance(candle, dict)
+            and isinstance(candle.get("time"), str)
+            and isinstance(candle.get("close"), (int, float))
+            and math.isfinite(candle["close"])
+        ][-120:]
+        for key in ("price", "bid", "ask", "sma50", "atr", "atr_pct", "bbwp"):
+            if key in clean and (
+                not isinstance(clean[key], (int, float))
+                or not math.isfinite(clean[key])
+            ):
+                clean.pop(key)
+        clean_market[symbol] = clean
+
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "symbols": clean_market,
+    }
+    path = ROOT / "logs" / "market_dashboard_snapshot.json"
+    temp_path = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path.write_text(json.dumps(record, allow_nan=False), encoding="utf-8")
+        os.replace(temp_path, path)
+    except (OSError, TypeError, ValueError):
+        log.exception("Unable to publish sanitized market data for the read-only dashboard.")
         try:
             temp_path.unlink()
         except FileNotFoundError:
@@ -373,21 +430,36 @@ def single_instance_lock():
     lock_path = ROOT / "logs" / "autonomous.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock_file = lock_path.open("a+b")
+    acquired = False
     try:
-        lock_file.seek(0)
-        if not lock_file.read(1):
-            lock_file.write(b"0")
-            lock_file.flush()
-        lock_file.seek(0)
-        try:
-            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
-        except OSError as exc:
-            raise RuntimeError("Another autonomous runner instance is already active.") from exc
+        if os.name == "nt":
+            if os.fstat(lock_file.fileno()).st_size == 0:
+                lock_file.write(b"\0")
+                lock_file.flush()
+            lock_file.seek(0)
+            try:
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                raise RuntimeError(
+                    "Another autonomous runner instance is already active."
+                ) from exc
+        else:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise RuntimeError(
+                    "Another autonomous runner instance is already active."
+                ) from exc
+        acquired = True
         yield
     finally:
         try:
-            lock_file.seek(0)
-            msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            if acquired:
+                if os.name == "nt":
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
         finally:
             lock_file.close()
 
@@ -423,7 +495,8 @@ def load_paper_settings() -> Settings:
 
 
 def load_crypto_symbols() -> tuple[str, ...]:
-    raw_symbols = os.getenv("CRYPTO_SYMBOLS", "BTC/USD,ETH/USD").split(",")
+    """Return explicitly configured crypto symbols; an empty setting disables polling."""
+    raw_symbols = os.getenv("CRYPTO_SYMBOLS", "").split(",")
     symbols = tuple(dict.fromkeys(value.strip().upper() for value in raw_symbols if value.strip()))
     invalid = [symbol for symbol in symbols if not CRYPTO_SYMBOL_PATTERN.fullmatch(symbol)]
     if invalid:
@@ -435,7 +508,8 @@ def load_crypto_symbols() -> tuple[str, ...]:
 
 
 def _bar_time(raw: str) -> datetime:
-    return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(timezone.utc)
+    normalized = re.sub(r"(\.\d{6})\d+", r"\1", raw)
+    return datetime.fromisoformat(normalized.replace("Z", "+00:00")).astimezone(timezone.utc)
 
 
 def _feed_bar(state: SymbolState, bar: dict[str, Any]) -> None:
@@ -586,10 +660,12 @@ class AutonomousRunner:
         settings: Settings,
         client: AlpacaClient,
         broker_adapter: BaseBrokerAdapter | None = None,
+        risk_gate: RiskGateClient | None = None,
     ):
         self.settings = settings
         self.client = client
         self.broker_adapter = broker_adapter or AlpacaPaperAdapter(client)
+        self.risk_gate = risk_gate or RiskGateClient()
         self.symbols = settings.watchlist
         self.crypto_symbols = load_crypto_symbols()
         self.risk = RiskEngine(settings.risk)
@@ -603,6 +679,10 @@ class AutonomousRunner:
         self.crypto_last_research_at: datetime | None = None
         self.crypto_last_bar: dict[str, datetime] = {}
         self.crypto_mtf_refreshed_at: datetime | None = None
+        self.crypto_error_last_logged_at: float | None = None
+        self.crypto_market_data: dict[str, dict[str, Any]] = {}
+        self.dashboard_market_last_refresh_at: datetime | None = None
+        self.dashboard_market_error_last_logged_at: float | None = None
         self.watermarks: dict[str, datetime] = {}
         self.managed: dict[str, ManagedPosition] = {}
         self.last_quotes: dict[str, Quote] = {}
@@ -610,6 +690,9 @@ class AutonomousRunner:
         self.session_day = None
         self.session_equity = 0.0
         self.halted = False
+        self.risk_gateway_halted = False
+        self.risk_gateway_halt_reason = ""
+        self.last_reconciliation_at = 0.0
         self.flattened_day = None
         self.prepared_day: date | None = None
         self.heartbeat_status = "waiting"
@@ -648,6 +731,62 @@ class AutonomousRunner:
             )
             return False
         return True
+
+    def _halt_for_risk_gateway(self, reason: str) -> None:
+        self.risk_gateway_halted = True
+        self.risk_gateway_halt_reason = reason
+        self.halted = True
+        self.heartbeat_status = "disconnected"
+        self.heartbeat_message = (
+            f"RISK GATE HALT: {reason}; all broker order changes are stopped."
+        )
+        log.critical(self.heartbeat_message)
+        if self.session_day is not None:
+            try:
+                self._persist_session_guard()
+            except OSError:
+                log.exception("Unable to persist the risk gateway halt.")
+        try:
+            write_heartbeat(
+                self.heartbeat_status, self.heartbeat_message, self.symbols,
+                telemetry={
+                    "event": "risk_gateway_halt",
+                    "reason": reason,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+        except OSError:
+            log.exception("Unable to publish the risk gateway halt heartbeat.")
+
+    def _check_risk_gateway(self) -> bool:
+        if self.risk_gateway_halted:
+            return False
+        try:
+            self.risk_gate.health()
+        except RiskGateUnavailable as exc:
+            self._halt_for_risk_gateway(str(exc))
+            return False
+        return True
+
+    def _authorize_order_mutation(self, operation: str, **details: Any) -> None:
+        if self.risk_gateway_halted:
+            raise RiskGateUnavailable(
+                self.risk_gateway_halt_reason or "risk gateway is latched halted"
+            )
+        request = {
+            "request_id": str(uuid.uuid4()),
+            "operation": operation,
+            **details,
+        }
+        try:
+            decision = self.risk_gate.authorize(request)
+        except RiskGateUnavailable as exc:
+            self._halt_for_risk_gateway(str(exc))
+            raise
+        if decision.get("approved") is not True:
+            reason = str(decision.get("reason", "risk gateway rejected order mutation"))
+            self._halt_for_risk_gateway(reason)
+            raise RiskGateRejected(reason)
 
     def _load_approved_candidate(self) -> None:
         path = ROOT / "data" / "active_paper_candidate.json"
@@ -720,6 +859,9 @@ class AutonomousRunner:
                 log.info("Close order already pending for identified test position %s.", symbol)
                 waiting = True
                 continue
+            self._authorize_order_mutation(
+                "close_position", symbol=symbol, purpose="identified_test_cleanup",
+            )
             result = self.client.close_position(symbol)
             log.warning("Submitted close for identified paper test position %s qty=%s order=%s",
                         symbol, position.get("qty"), result.get("id", "unknown"))
@@ -786,6 +928,19 @@ class AutonomousRunner:
             prior_time = self.crypto_last_bar.get(symbol)
             if prior_time is None or latest_bar.start > prior_time:
                 self.crypto_last_bar[symbol] = latest_bar.start
+                self.crypto_market_data[symbol] = {
+                    "asset_class": "crypto",
+                    "display_symbol": symbol.replace("/", "-"),
+                    "price": latest_bar.close,
+                    "bid": quote.bid,
+                    "ask": quote.ask,
+                    "timestamp": quote.ts.isoformat(),
+                    "candles": [
+                        {"time": bar.start.isoformat(), "close": bar.close}
+                        for bar in latest[-120:]
+                    ],
+                    "regime": "24/7 · order routing disabled",
+                }
                 log.info(
                     "CRYPTO RESEARCH %s 24/7 mark=%.4f bid=%.4f ask=%.4f spread=%.3f%%; "
                     "hourly_bars=%d daily_bars=%d; paper execution disabled pending "
@@ -794,6 +949,19 @@ class AutonomousRunner:
                     (quote.ask - quote.bid) / quote.ask * 100 if quote.ask > 0 else 0,
                     len(self.hourly_bars.get(symbol, [])), len(self.daily_bars.get(symbol, [])),
                 )
+
+    def _log_crypto_research_failure(self, error: Exception) -> None:
+        monotonic_now = time.monotonic()
+        if (
+            self.crypto_error_last_logged_at is None
+            or monotonic_now - self.crypto_error_last_logged_at >= 300
+        ):
+            log.warning(
+                "Crypto research data is unavailable; equity processing will continue "
+                "(%s: %s).",
+                type(error).__name__, error,
+            )
+            self.crypto_error_last_logged_at = monotonic_now
 
     def _prepare_session(self, now: datetime, next_open: datetime) -> None:
         candidates = self.selector.select(now)
@@ -841,18 +1009,24 @@ class AutonomousRunner:
             commission_min=float(os.getenv("BACKTEST_COMMISSION_MIN", "0.35")),
             sell_fee_bps=float(os.getenv("BACKTEST_SELL_FEE_BPS", "0.3")),
         )
+        cycle_id = f"{now.date().isoformat()}:{','.join(symbols)}"
+        trial_ledger_path = ROOT / "logs" / "strategy_trial_ledger.json"
         folds, oos_trades, results = walk_forward(
             data, base, train_days=30, test_days=10,
             min_train_trades=8, workers=int(os.getenv("OPTIMIZATION_WORKERS", "2")),
+            trial_cycle_id=cycle_id, trial_ledger_path=trial_ledger_path,
         )
         if not folds:
             log.warning("Daily optimization found no qualifying walk-forward folds; retaining baseline profile.")
             return
         latest = folds[-1]
         profile = apply_params(base, latest["params"])
-        cycle_id = f"{now.date().isoformat()}:{','.join(symbols)}"
         trial_count = register_trials(
-            cycle_id, len(results), ROOT / "logs" / "strategy_trial_ledger.json"
+            cycle_id, len(results), trial_ledger_path
+        )
+        cpcv_report = evaluate_cpcv(
+            data, base, results, n_trials=trial_count,
+            workers=int(os.getenv("OPTIMIZATION_WORKERS", "2")),
         )
         params_fingerprint = hashlib.sha256(
             json.dumps(latest["params"], sort_keys=True).encode("utf-8")
@@ -876,6 +1050,8 @@ class AutonomousRunner:
             "profit_factor": oos_metrics["profit_factor"],
             "max_drawdown_pct": oos_metrics["max_dd_pct"],
             "n_trials": trial_count,
+            "pbo": cpcv_report["pbo"],
+            "cpcv": cpcv_report,
             "expected_slippage_drag": slippage_drag,
             "simulated_slippage_drag": slippage_drag,
             "simulated_transaction_costs": oos_metrics["costs"],
@@ -905,6 +1081,8 @@ class AutonomousRunner:
             "candidate_id": candidate_id,
             "human_approval_required": True,
             "n_trials": trial_count,
+            "cpcv": cpcv_report,
+            "pbo": finite_or_none(cpcv_report["pbo"]),
             "raw_sharpe": finite_or_none(oos_metrics["sharpe_daily_ann"]),
             "deflated_sharpe_probability": audit["deflated_sharpe_probability"],
             "holdout": holdout,
@@ -931,6 +1109,8 @@ class AutonomousRunner:
                 "candidate_id": candidate_id,
                 "status": audit["status"],
                 "n_trials": trial_count,
+                "pbo": finite_or_none(cpcv_report["pbo"]),
+                "cpcv_passed": cpcv_report["passed"],
                 "raw_sharpe": audit["raw_sharpe"],
                 "deflated_sharpe_probability": audit["deflated_sharpe_probability"],
                 "expected_slippage_drag": slippage_drag,
@@ -981,6 +1161,129 @@ class AutonomousRunner:
                 self.last_quotes.pop(symbol, None)
                 self.states[symbol].last_quote = None
 
+    def _publish_dashboard_market_snapshot(self) -> None:
+        market = dict(self.crypto_market_data)
+        for symbol in self.symbols:
+            state = self.states.get(symbol)
+            if state is None:
+                continue
+            quote = self.last_quotes.get(symbol)
+            minute_bars = list(state.agg.bars["1m"])[-120:]
+            five_minute_bars = list(state.agg.bars["5m"])
+            daily_closes = state.daily_closes
+            current_price = (
+                quote.mid if quote is not None
+                else minute_bars[-1].close if minute_bars
+                else state.last_price
+            )
+            if current_price is None or not math.isfinite(current_price):
+                continue
+            sma50 = simple_moving_average(daily_closes, 50)
+            trend = (
+                "above" if sma50 is not None and current_price >= sma50
+                else "below" if sma50 is not None else "unavailable"
+            )
+            atr_value = atr(five_minute_bars, 14)
+            closes = [bar.close for bar in five_minute_bars]
+            bbwp_value = bbwp(closes)
+            regime = f"{trend} 50-day trend" if trend != "unavailable" else "trend unavailable"
+            if bbwp_value is not None and bbwp_value < 20:
+                regime += " · volatility squeeze"
+            market[symbol] = {
+                "asset_class": "equity",
+                "display_symbol": symbol,
+                "price": current_price,
+                "bid": quote.bid if quote is not None else None,
+                "ask": quote.ask if quote is not None else None,
+                "timestamp": quote.ts.isoformat() if quote is not None else None,
+                "trend_50d": trend,
+                "sma50": sma50,
+                "atr": atr_value,
+                "atr_pct": (
+                    atr_value / current_price * 100
+                    if atr_value is not None and current_price > 0 else None
+                ),
+                "bbwp": bbwp_value,
+                "regime": regime,
+                "candles": [
+                    {"time": bar.start.isoformat(), "close": bar.close}
+                    for bar in minute_bars
+                ],
+            }
+        write_dashboard_market_snapshot(market)
+
+    def _publish_dashboard_market_snapshot_while_closed(self, now: datetime) -> None:
+        if (
+            self.dashboard_market_last_refresh_at is not None
+            and now - self.dashboard_market_last_refresh_at < timedelta(minutes=5)
+        ):
+            return
+        self.dashboard_market_last_refresh_at = now
+        start = now - timedelta(days=7)
+        minute_rows = self.client.bars(self.symbols, "1Min", start, now, limit=10000)
+        daily_rows = self.client.bars(
+            self.symbols, "1Day", now - timedelta(days=400), now, limit=500
+        )
+        market = dict(self.crypto_market_data)
+        for symbol in self.symbols:
+            minute_bars = _raw_bars(minute_rows.get(symbol, []), BAR_INTERVAL, now)[-120:]
+            daily_bars = _raw_bars(
+                daily_rows.get(symbol, []), timedelta(days=1), now
+            )
+            current_price = (
+                minute_bars[-1].close if minute_bars
+                else daily_bars[-1].close if daily_bars
+                else None
+            )
+            if current_price is None or not math.isfinite(current_price):
+                continue
+            sma50 = simple_moving_average([bar.close for bar in daily_bars], 50)
+            trend = (
+                "above" if sma50 is not None and current_price >= sma50
+                else "below" if sma50 is not None else "unavailable"
+            )
+            atr_value = atr(minute_bars, 14)
+            bbwp_value = bbwp([bar.close for bar in minute_bars])
+            regime = f"{trend} 50-day trend" if trend != "unavailable" else "trend unavailable"
+            if bbwp_value is not None and bbwp_value < 20:
+                regime += " · volatility squeeze"
+            market[symbol] = {
+                "asset_class": "equity",
+                "display_symbol": symbol,
+                "price": current_price,
+                "timestamp": (
+                    minute_bars[-1].start.isoformat()
+                    if minute_bars else daily_bars[-1].start.isoformat()
+                ),
+                "trend_50d": trend,
+                "sma50": sma50,
+                "atr": atr_value,
+                "atr_pct": (
+                    atr_value / current_price * 100
+                    if atr_value is not None and current_price > 0 else None
+                ),
+                "bbwp": bbwp_value,
+                "regime": regime,
+                "candles": [
+                    {"time": bar.start.isoformat(), "close": bar.close}
+                    for bar in minute_bars
+                ],
+            }
+        write_dashboard_market_snapshot(market)
+
+    def _log_dashboard_market_failure(self, error: Exception) -> None:
+        monotonic_now = time.monotonic()
+        if (
+            self.dashboard_market_error_last_logged_at is None
+            or monotonic_now - self.dashboard_market_error_last_logged_at >= 300
+        ):
+            log.warning(
+                "Closed-market dashboard data is unavailable; paper execution is unaffected "
+                "(%s: %s).",
+                type(error).__name__, error,
+            )
+            self.dashboard_market_error_last_logged_at = monotonic_now
+
     def _account_and_positions(self):
         account = self.client.account()
         if account.get("trading_blocked") or account.get("account_blocked"):
@@ -997,6 +1300,28 @@ class AutonomousRunner:
             log.exception("Unable to refresh recent paper orders for the dashboard snapshot.")
             recent_orders = list(orders.values())
         write_dashboard_paper_snapshot(account, all_positions, recent_orders)
+        now = time.time()
+        if now - self.last_reconciliation_at >= float(
+            os.getenv("RISK_RECONCILIATION_INTERVAL_SECONDS", "60")
+        ):
+            try:
+                report = self.risk_gate.reconcile({
+                    "request_id": str(uuid.uuid4()),
+                    "mode": self.settings.mode.value,
+                    "account": account,
+                    "positions": all_positions,
+                    "target_symbols": list(self.symbols),
+                    "managed_symbols": list(self.managed),
+                    "source": "autonomous_runner",
+                })
+            except RiskGateUnavailable as exc:
+                self._halt_for_risk_gateway(str(exc))
+                raise
+            if report.get("approved") is not True:
+                reason = str(report.get("reason", "broker reconciliation failed"))
+                self._halt_for_risk_gateway(reason)
+                raise RiskGateRejected(reason)
+            self.last_reconciliation_at = now
         return account, positions, orders
 
     def _publish_dashboard_snapshot_while_closed(self) -> None:
@@ -1057,8 +1382,14 @@ class AutonomousRunner:
 
     def _kill_switch(self, now: datetime, positions: dict[str, dict[str, Any]]) -> bool:
         if self.halted:
+            self._authorize_order_mutation(
+                "cancel_orders", symbols=list(self.symbols), purpose="session_halt",
+            )
             self.client.cancel_orders(self.symbols)
             for symbol in positions:
+                self._authorize_order_mutation(
+                    "close_position", symbol=symbol, purpose="session_halt",
+                )
                 self.client.close_position(symbol)
                 log.warning("Persisted session halt re-submitted close for %s", symbol)
             return True
@@ -1084,8 +1415,14 @@ class AutonomousRunner:
             "timestamp": now.isoformat(),
         }
         write_heartbeat("active", message[:240], self.symbols, telemetry)
+        self._authorize_order_mutation(
+            "cancel_orders", symbols=list(self.symbols), purpose="daily_drawdown_kill",
+        )
         self.client.cancel_orders(self.symbols)
         for symbol in positions:
+            self._authorize_order_mutation(
+                "close_position", symbol=symbol, purpose="daily_drawdown_kill",
+            )
             self.client.close_position(symbol)
             log.warning("Kill switch submitted close for %s", symbol)
         return True
@@ -1094,7 +1431,13 @@ class AutonomousRunner:
         if self.flattened_day == session_day:
             return
         for symbol in positions:
+            self._authorize_order_mutation(
+                "cancel_orders", symbols=[symbol], purpose="closing_bell_flatten",
+            )
             self.client.cancel_orders((symbol,))
+            self._authorize_order_mutation(
+                "close_position", symbol=symbol, purpose="closing_bell_flatten",
+            )
             result = self.client.close_position(symbol)
             log.warning("Closing-bell flatten submitted for %s order=%s",
                         symbol, result.get("id", "unknown"))
@@ -1169,6 +1512,15 @@ class AutonomousRunner:
             if not stop_order_ids:
                 log.error("Cannot trail %s: bracket stop order ID unavailable.", symbol)
                 continue
+            self._authorize_order_mutation(
+                "update_stop",
+                symbol=symbol,
+                side="long" if long_ else "short",
+                current_stop=managed.stop,
+                new_stop=round(new_stop, 2),
+                current_price=state.last_price,
+                order_ids=stop_order_ids,
+            )
             for stop_order_id in stop_order_ids:
                 self.client.update_order(stop_order_id, {"stop_price": round(new_stop, 2)})
             log.info("Trailed %s stop %.2f -> %.2f across %d bracket tranche(s).",
@@ -1259,8 +1611,8 @@ class AutonomousRunner:
             rejection = f"MTF filter: {mtf.reason}"
         if decision.take and entry_blocker:
             rejection = entry_blocker
+        required_score = self.alpha.min_score
         if decision.take and decision.side is not None:
-            required_score = self.alpha.min_score
             if phase == "opening":
                 required_score = max(required_score, 0.75)
                 if atr_value is None or atr_value <= 0:
@@ -1397,22 +1749,9 @@ class AutonomousRunner:
                 (first_qty, 1.5),
                 (qty - first_qty, max(1.5, self.settings.risk.min_reward_risk)),
             ]
-        self.managed[symbol] = ManagedPosition(
-            symbol=symbol,
-            side=decision.side,
-            qty=qty,
-            entry=entry_reference,
-            initial_stop=stop_price,
-            stop=stop_price,
-            extreme=entry_reference,
-            stop_order_ids=stop_ids,
-            initial_qty=qty,
-            partial_qty=partial_qty,
-            runner_qty=runner_qty,
-            entry_order_ids=entry_ids,
-            entry_tranches_expected=len(tranches),
-        )
         epoch = int(ts.timestamp())
+        order_plans = []
+        risk_orders = []
         for index, (tranche_qty, target_r) in enumerate(tranches, start=1):
             target_price = round(
                 entry_reference + target_r * stop_distance if decision.side is Side.LONG
@@ -1431,6 +1770,55 @@ class AutonomousRunner:
                 "stop_loss": {"stop_price": stop_price},
                 "client_order_id": client_id,
             }
+            order_plans.append((tranche_qty, target_r, client_id, payload))
+            risk_orders.append({
+                "symbol": symbol,
+                "qty": tranche_qty,
+                "side": side,
+                "limit_price": round(limit_price, 2),
+                "stop_price": stop_price,
+                "take_profit_price": target_price,
+                "client_order_id": client_id,
+            })
+        try:
+            risk_decision = self.risk_gate.authorize({
+                "request_id": str(uuid.uuid4()),
+                "operation": "submit_batch",
+                "mode": self.settings.mode.value,
+                "account_equity": equity,
+                "open_symbols": sorted(set(positions) | set(orders)),
+                "orders": risk_orders,
+                "phase": phase,
+                "signal_score": decision.score,
+            })
+        except RiskGateUnavailable as exc:
+            self._halt_for_risk_gateway(str(exc))
+            raise
+        if risk_decision.get("approved") is not True:
+            reason = str(risk_decision.get("reason", "independent risk engine rejected the order"))
+            telemetry.update({"accepted": False, "reason": reason})
+            log.warning("Independent risk engine rejected %s order batch: %s", symbol, reason)
+            write_heartbeat(
+                "active", f"{symbol}: independent risk engine rejected the order batch.",
+                self.symbols, telemetry,
+            )
+            return
+        self.managed[symbol] = ManagedPosition(
+            symbol=symbol,
+            side=decision.side,
+            qty=qty,
+            entry=entry_reference,
+            initial_stop=stop_price,
+            stop=stop_price,
+            extreme=entry_reference,
+            stop_order_ids=stop_ids,
+            initial_qty=qty,
+            partial_qty=partial_qty,
+            runner_qty=runner_qty,
+            entry_order_ids=entry_ids,
+            entry_tranches_expected=len(tranches),
+        )
+        for tranche_qty, target_r, client_id, payload in order_plans:
             order = self.broker_adapter.submit_protected_order("stock", payload)
             orders[symbol] = order
             if order.get("id"):
@@ -1492,13 +1880,15 @@ class AutonomousRunner:
                 )
 
     def run_once(self) -> float:
+        if self.risk_gateway_halted or not self._check_risk_gateway():
+            return POLL_SECONDS
         clock = self.client.clock()
         now = datetime.now(timezone.utc)
         if self.crypto_symbols:
             try:
                 self._run_crypto_research(now)
-            except (urllib.error.URLError, TimeoutError, AlpacaAPIError, ValueError):
-                log.exception("Crypto research data cycle failed; no crypto orders are enabled.")
+            except (urllib.error.URLError, TimeoutError, AlpacaAPIError, ValueError) as exc:
+                self._log_crypto_research_failure(exc)
         if not clock.get("is_open"):
             self.heartbeat_status = "waiting"
             crypto_state = (
@@ -1514,6 +1904,10 @@ class AutonomousRunner:
                 crypto_symbols=self.crypto_symbols,
             )
             self._publish_dashboard_snapshot_while_closed()
+            try:
+                self._publish_dashboard_market_snapshot_while_closed(now)
+            except Exception as exc:
+                self._log_dashboard_market_failure(exc)
             if self._cleanup_identified_test_positions(market_open=False):
                 return 60.0
             local_now = now.astimezone(NY)
@@ -1582,6 +1976,7 @@ class AutonomousRunner:
             bars, now, account, positions, orders,
             entry_blocker=macro_guard.reason if macro_guard.blocked else None,
         )
+        self._publish_dashboard_market_snapshot()
         return POLL_SECONDS
 
     async def run_forever(self, stop_event: threading.Event | None = None) -> None:
@@ -1644,6 +2039,12 @@ class AutonomousRunner:
 
 
 def dry_run(client: AlpacaClient, settings: Settings) -> int:
+    try:
+        RiskGateClient().health()
+    except RiskGateUnavailable as exc:
+        print(f"Risk engine readiness: BLOCKED ({exc})")
+        return 2
+    print("Independent risk engine heartbeat: OK")
     clock = client.clock()
     account = client.account()
     if account.get("trading_blocked") or account.get("account_blocked"):

@@ -2,7 +2,25 @@
 .env.*
 !.env.example
 ssh-key-*.key
+ssh-key-*.key.pub
+
+# Python bytecode and test caches (never commit generated files)
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Runtime telemetry and mutable state
+logs/
+data/*
+!data/.gitkeep
+!data/universe.csv
 deploy/phase0/deployment.env
 deploy/phase0/oauth2-proxy.env
 deploy/phase0/certs/
+deploy/phase2/risk-gate.env
+logs/risk_audit.jsonl
+logs/risk_audit.jsonl.anchor
+logs/risk_engine_state.json
+logs/risk_engine_heartbeat.json
 .certbot-webroot/

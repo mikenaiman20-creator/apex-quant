@@ -231,6 +231,7 @@ class SymbolState:
         self.book = BookSnapshot()
         self.last_quote: Optional[Quote] = None
         self.last_price: Optional[float] = None
+        self.market_state: Optional["SymbolState"] = None
         self.daily_closes: List[float] = []  # seeded from history; used for the Daily 50 EMA
         self.tape: Deque[Trade] = deque(maxlen=5000)
         self._recent: Deque[Trade] = deque(maxlen=200)  # cheap window for block-trade detection

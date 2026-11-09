@@ -1,0 +1,10 @@
+[Unit]
+Description=Loopback socket for the isolated Apex Quant risk gateway
+
+[Socket]
+ListenStream=127.0.0.1:18765
+NoDelay=true
+Service=apex-risk-gateway-proxy.service
+
+[Install]
+WantedBy=sockets.target

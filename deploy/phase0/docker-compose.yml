@@ -12,8 +12,6 @@ services:
       - chroma_data:/chroma/chroma
     networks:
       - chroma-isolated
-    security_opt:
-      - no-new-privileges:true
 
   streamlit:
     build:
@@ -26,6 +24,8 @@ services:
       HOME: /tmp
       STREAMLIT_CONFIG_DIR: /tmp/.streamlit
       XDG_CACHE_HOME: /tmp/.cache
+      APEX_UI_OLLAMA_URL: ${APEX_UI_OLLAMA_URL:-http://ollama:11434}
+      APEX_UI_OLLAMA_MODEL: ${APEX_UI_OLLAMA_MODEL:-qwen2.5-coder:1.5b}
     command:
       - streamlit
       - run
@@ -40,13 +40,12 @@ services:
       - /home/ubuntu/apex_quant/data:/app/data:ro
     networks:
       - apex-internal
+      - apex-llm-internal
     expose:
       - "8501"
     read_only: true
     tmpfs:
       - /tmp:size=32m,noexec,nosuid
-    security_opt:
-      - no-new-privileges:true
     cap_drop:
       - ALL
     healthcheck:
@@ -60,6 +59,33 @@ services:
       retries: 3
       start_period: 20s
 
+  ollama:
+    image: ${OLLAMA_IMAGE:-ollama/ollama@sha256:55d6d58fce77338d8b626abbbbec63b79deeb24db3fd67b8a99951a84083552f}
+    restart: unless-stopped
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_KEEP_ALIVE: 5m
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - apex-llm-internal
+    expose:
+      - "11434"
+    mem_limit: 3g
+    cpus: 1.0
+    pids_limit: 128
+    healthcheck:
+      test:
+        - CMD
+        - ollama
+        - list
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
   oauth2-proxy:
     image: ${OAUTH2_PROXY_IMAGE:?Set OAUTH2_PROXY_IMAGE to a verified, digest-pinned image}
     restart: unless-stopped
@@ -68,11 +94,12 @@ services:
     command:
       - --http-address=0.0.0.0:4180
       - --provider=github
-      - --scope=user:email
+      - --scope=user:email read:org
       - --email-domain=*
       - --authenticated-emails-file=/etc/oauth2-proxy/allowed_emails
       - --redirect-url=https://151.145.93.209.nip.io/oauth2/callback
       - --cookie-domain=151.145.93.209.nip.io
+      - --whitelist-domain=151.145.93.209.nip.io
       - --upstream=static://200
       - --skip-provider-button=true
       - --reverse-proxy=true
@@ -88,8 +115,6 @@ services:
       - egress
     expose:
       - "4180"
-    security_opt:
-      - no-new-privileges:true
 
   nginx:
     image: ${NGINX_IMAGE:?Set NGINX_IMAGE to a verified, digest-pinned image}
@@ -107,12 +132,13 @@ services:
     networks:
       - apex-internal
       - egress
-    security_opt:
-      - no-new-privileges:true
 
 networks:
   apex-internal:
     name: apex-internal
+    external: true
+  apex-llm-internal:
+    name: apex-llm-internal
     internal: true
   chroma-isolated:
     name: apex-chroma-isolated
@@ -123,3 +149,4 @@ networks:
 
 volumes:
   chroma_data:
+  ollama_data:

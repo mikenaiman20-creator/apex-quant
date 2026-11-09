@@ -1,0 +1,60 @@
+services:
+  risk-engine:
+    build:
+      context: ../..
+      dockerfile: deploy/phase2/Dockerfile
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:?Set PYTHON_IMAGE to a verified, digest-pinned image}
+    user: "${APEX_RUNTIME_UID:?Set APEX_RUNTIME_UID}:${APEX_RUNTIME_GID:?Set APEX_RUNTIME_GID}"
+    restart: unless-stopped
+    env_file:
+      - ../phase2/risk-gate.env
+    environment:
+      RISK_ALLOWED_SYMBOLS: ${RISK_ALLOWED_SYMBOLS:-SPY,QQQ,NVDA}
+      RISK_MAX_PER_TRADE_PCT: ${RISK_MAX_PER_TRADE_PCT:-0.005}
+      RISK_MAX_POSITION_NOTIONAL_PCT: ${RISK_MAX_POSITION_NOTIONAL_PCT:-0.20}
+      RISK_MAX_OPEN_POSITIONS: ${RISK_MAX_OPEN_POSITIONS:-3}
+      RISK_MIN_REWARD_RISK: ${RISK_MIN_REWARD_RISK:-1.5}
+      RISK_RECONCILIATION_TOLERANCE_USD: ${RISK_RECONCILIATION_TOLERANCE_USD:-5.0}
+      RISK_RECONCILIATION_TOLERANCE_PCT: ${RISK_RECONCILIATION_TOLERANCE_PCT:-0.001}
+      RISK_AUDIT_PATH: /app/logs/risk_audit.jsonl
+      RISK_STATE_PATH: /app/logs/risk_engine_state.json
+      RISK_HEARTBEAT_PATH: /app/logs/risk_engine_heartbeat.json
+    command:
+      - python
+      - -m
+      - server.risk_engine
+      - serve
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8765"
+    volumes:
+      - /home/ubuntu/apex_quant/logs:/app/logs
+    networks:
+      risk-internal:
+        ipv4_address: 172.20.0.2
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    cap_drop:
+      - ALL
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json,urllib.request; d=json.load(urllib.request.urlopen('http://127.0.0.1:8765/health',timeout=2)); assert d.get('status') == 'ready'"
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    stop_grace_period: 10s
+
+networks:
+  risk-internal:
+    name: apex-risk-internal
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

@@ -35,8 +35,10 @@ class BTConfig:
     entry_start: time = time(9, 45)
     entry_end: time = time(15, 30)
     flat_at: time = time(15, 55)
+    zscore_entry_threshold: float = 2.0
     slippage_bps: float = 1.0
     slippage_atr_mult: float = 0.1
+    spread_bps: float = 2.0
     commission_per_share: float = 0.0035  # IBKR tiered-ish; set 0 to model Alpaca commission-free
     commission_min: float = 0.35
     sell_fee_bps: float = 0.3             # SEC + TAF approx, sells only
@@ -46,11 +48,17 @@ class BTConfig:
 
     def __post_init__(self):
         cost_values = (
-            self.slippage_bps, self.slippage_atr_mult, self.commission_per_share,
+            self.slippage_bps, self.slippage_atr_mult, self.spread_bps,
+            self.commission_per_share,
             self.commission_min, self.sell_fee_bps,
         )
         if not all(math.isfinite(value) and value >= 0 for value in cost_values):
             raise ValueError("Transaction cost configuration must be finite and non-negative.")
+        if (
+            not math.isfinite(self.zscore_entry_threshold)
+            or self.zscore_entry_threshold < 2.0
+        ):
+            raise ValueError("Z-score entry threshold must be finite and at least 2.0.")
 
 
 @dataclass
@@ -94,6 +102,8 @@ class _Pos:
     entry_slippage_cost: float
     entry_commission_cost: float
     entry_regulatory_fees: float
+    trail_distance: Optional[float]
+    trail_activation_r: float
 
 
 @dataclass
@@ -127,11 +137,21 @@ def _normalize_reject(msg: str) -> str:
     return "score below threshold" if msg.startswith("score") else re.sub(r"[\d\.\-%]+", "#", msg)
 
 
-def run_backtest(data: Dict[str, List[MinuteBar]], cfg: BTConfig, signal_fn: Optional[SignalFn] = None) -> BTResult:
+def run_backtest(
+    data: Dict[str, List[MinuteBar]],
+    cfg: BTConfig,
+    signal_fn: Optional[SignalFn] = None,
+    *,
+    reset_equity_days: set[date] | frozenset[date] = frozenset(),
+) -> BTResult:
     rng = random.Random(cfg.seed)
     risk = RiskEngine(cfg.risk)
     alpha = AlphaEngine(risk, cfg.min_signal_score)
     states = {s: SymbolState(s) for s in data}
+    market_state = states.get("SPY")
+    for state in states.values():
+        state.market_state = market_state
+        state.zscore_entry_threshold = cfg.zscore_entry_threshold
     by_ts: Dict[datetime, List[Tuple[str, MinuteBar]]] = defaultdict(list)
     for sym, bars in data.items():
         for b in bars:
@@ -141,8 +161,10 @@ def run_backtest(data: Dict[str, List[MinuteBar]], cfg: BTConfig, signal_fn: Opt
     positions: Dict[str, _Pos] = {}
     pending: Dict[str, Tuple[Decision, date]] = {}
     last_close: Dict[str, float] = {}
+    last_seen_ts: Dict[str, datetime] = {}
     realized = 0.0
     minimum_slip = cfg.slippage_bps / 1e4
+    half_spread = cfg.spread_bps / 2 / 1e4
     cur_day: Optional[date] = None
     day_start = cfg.initial_equity
     halted = False
@@ -190,16 +212,30 @@ def run_backtest(data: Dict[str, List[MinuteBar]], cfg: BTConfig, signal_fn: Opt
             cfg.slippage_atr_mult * five_minute_atr / b.o
             if five_minute_atr is not None and b.o > 0 else 0.0
         )
-        slip = max(minimum_slip, dynamic_slip)
+        slip = half_spread + max(minimum_slip, dynamic_slip)
         fill = b.o * (1 + slip) if long_ else b.o * (1 - slip)
         stop = dec.stop
         if stop is None or (long_ and fill <= stop) or (not long_ and fill >= stop):
             return
+        if dec.trail_distance is not None and (
+            not math.isfinite(dec.trail_distance)
+            or dec.trail_distance <= 0
+            or not math.isfinite(dec.trail_activation_r)
+            or dec.trail_activation_r < 0
+        ):
+            raise ValueError(f"Invalid trailing-stop configuration for {sym}.")
         qty = risk.size(equity(), fill, stop)
         if qty < 1:
             return
         dist = abs(fill - stop)
-        target = fill + cfg.risk.min_reward_risk * dist if long_ else fill - cfg.risk.min_reward_risk * dist
+        target = dec.target
+        if target is None:
+            target = (
+                fill + cfg.risk.min_reward_risk * dist
+                if long_ else fill - cfg.risk.min_reward_risk * dist
+            )
+        if not math.isfinite(target) or (long_ and target <= fill) or (not long_ and target >= fill):
+            return
         entry_commission = commission(qty)
         entry_regulatory = 0.0 if long_ else fill * qty * cfg.sell_fee_bps / 1e4
         entry_slippage = abs(fill - b.o) * qty
@@ -208,15 +244,23 @@ def run_backtest(data: Dict[str, List[MinuteBar]], cfg: BTConfig, signal_fn: Opt
         positions[sym] = _Pos(
             sym, dec.side, qty, fill, b.o, stop, stop, target, fill, b.ts, cost,
             dec.score, dec.rationale() if dec.checks else "", slip, entry_slippage,
-            entry_commission, entry_regulatory,
+            entry_commission, entry_regulatory, dec.trail_distance,
+            dec.trail_activation_r,
         )
 
     for ts in sorted(by_ts):
         local = ts.astimezone(NY)
         d, tod = local.date(), local.time()
         if d != cur_day:
+            if d in reset_equity_days:
+                for sym in list(positions):
+                    close(sym, last_close[sym], "cpcv_reset", last_seen_ts[sym], True)
             if cur_day is not None:
+                for sym in list(positions):
+                    close(sym, last_close[sym], "eod", last_seen_ts[sym], True)
                 res.equity_curve.append((cur_day, equity()))
+            if d in reset_equity_days:
+                realized = 0.0
             cur_day, halted, day_start = d, False, equity()
             pending.clear()
 
@@ -225,6 +269,7 @@ def run_backtest(data: Dict[str, List[MinuteBar]], cfg: BTConfig, signal_fn: Opt
             st = states[sym]
             _feed(st, b)
             last_close[sym] = b.c
+            last_seen_ts[sym] = b.ts
 
             if sym in pending:
                 dec, sig_day = pending.pop(sym)
@@ -261,9 +306,18 @@ def run_backtest(data: Dict[str, List[MinuteBar]], cfg: BTConfig, signal_fn: Opt
                 close(sym, exit_px, reason, ts, adverse)
                 continue
             p.extreme = max(p.extreme, b.h) if long_ else min(p.extreme, b.l)
-            a5 = atr(list(st.agg.bars["5m"])[-60:], 14)
-            if a5:
-                p.stop = risk.manage_stop(p.side, p.entry, p.initial_stop, p.stop, b.c, p.extreme, a5)
+            if p.trail_distance is not None:
+                initial_risk = abs(p.entry - p.initial_stop)
+                if long_ and b.c - p.entry >= p.trail_activation_r * initial_risk:
+                    p.stop = max(p.stop, p.extreme - p.trail_distance)
+                elif not long_ and p.entry - b.c >= p.trail_activation_r * initial_risk:
+                    p.stop = min(p.stop, p.extreme + p.trail_distance)
+            else:
+                a5 = atr(list(st.agg.bars["5m"])[-60:], 14)
+                if a5:
+                    p.stop = risk.manage_stop(
+                        p.side, p.entry, p.initial_stop, p.stop, b.c, p.extreme, a5,
+                    )
 
         # daily drawdown kill-switch (marks open positions at the bar close)
         if not halted and equity() <= day_start * (1 - cfg.risk.daily_drawdown_kill_pct):
@@ -299,6 +353,8 @@ def run_backtest(data: Dict[str, List[MinuteBar]], cfg: BTConfig, signal_fn: Opt
             if dec is not None and dec.take:
                 pending[sym] = (dec, d)
 
+    for sym in list(positions):
+        close(sym, last_close[sym], "eod", last_seen_ts[sym], True)
     if cur_day is not None:
         res.equity_curve.append((cur_day, equity()))
     return res

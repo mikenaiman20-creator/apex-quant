@@ -4,9 +4,117 @@ from __future__ import annotations
 import math
 import random
 from collections import defaultdict
+from statistics import NormalDist
 from typing import Dict, List, Sequence, Tuple
 
 from backtest.data import NY
+
+
+def deflated_sharpe_probability(
+    annualized_sharpe: float | None,
+    observations: int,
+    n_trials: int,
+    *,
+    skewness: float = 0.0,
+    kurtosis: float = 3.0,
+    annualization: float = 252.0,
+    minimum_sharpe: float = 0.0,
+) -> Dict[str, float | int | bool | None]:
+    """Compute DSR significance against the trial-adjusted null.
+
+    The default has no absolute Sharpe hurdle; promotion policies may impose a
+    separate minimum after the statistical DSR gate.
+    """
+    trials = int(n_trials)
+    count = int(observations)
+    empty = {
+        "raw_sharpe": None,
+        "adjusted_sharpe": None,
+        "required_sharpe": None,
+        "n_trials": trials,
+        "observations": count,
+        "skewness": None,
+        "kurtosis": None,
+        "passed": False,
+    }
+    if (
+        trials < 1 or count < 3 or annualized_sharpe is None
+        or not math.isfinite(annualized_sharpe)
+        or not math.isfinite(skewness) or not math.isfinite(kurtosis)
+        or not math.isfinite(annualization) or annualization <= 0
+        or not math.isfinite(minimum_sharpe) or minimum_sharpe < 0
+        or kurtosis < 1
+    ):
+        return empty
+
+    sharpe = annualized_sharpe / math.sqrt(annualization)
+    variance = (
+        1.0 + 0.5 * sharpe ** 2 - skewness * sharpe
+        + ((kurtosis - 1.0) / 4.0) * sharpe ** 2
+    ) / (count - 1)
+    if not math.isfinite(variance) or variance <= 0:
+        return empty
+    standard_error = math.sqrt(variance)
+    if trials == 1:
+        expected_max = 0.0
+    else:
+        normal = NormalDist()
+        gamma = 0.5772156649015329
+        expected_max = standard_error * (
+            (1.0 - gamma) * normal.inv_cdf(1.0 - 1.0 / trials)
+            + gamma * normal.inv_cdf(1.0 - 1.0 / (trials * math.e))
+        )
+    probability = NormalDist().cdf((sharpe - expected_max) / standard_error)
+    required = max(
+        minimum_sharpe / math.sqrt(annualization),
+        expected_max + NormalDist().inv_cdf(0.95) * standard_error,
+    )
+    return {
+        "raw_sharpe": annualized_sharpe,
+        "adjusted_sharpe": probability,
+        "required_sharpe": required * math.sqrt(annualization),
+        "n_trials": trials,
+        "observations": count,
+        "skewness": skewness,
+        "kurtosis": kurtosis,
+        "passed": bool(annualized_sharpe >= required * math.sqrt(annualization)
+                       and probability >= 0.95),
+    }
+
+
+def deflated_sharpe_from_returns(
+    returns: Sequence[float],
+    n_trials: int,
+    *,
+    annualization: float = 252.0,
+    minimum_sharpe: float = 0.0,
+) -> Dict[str, float | int | bool | None]:
+    """Calculate DSR from a daily return series, including its skew and kurtosis."""
+    count = len(returns)
+    trials = int(n_trials)
+    if (
+        trials < 1 or count < 3
+        or not all(math.isfinite(value) for value in returns)
+    ):
+        return deflated_sharpe_probability(
+            None, count, trials, annualization=annualization,
+            minimum_sharpe=minimum_sharpe,
+        )
+    mean = sum(returns) / count
+    variance = sum((value - mean) ** 2 for value in returns) / (count - 1)
+    if not math.isfinite(variance) or variance <= 0:
+        return deflated_sharpe_probability(
+            None, count, trials, annualization=annualization,
+            minimum_sharpe=minimum_sharpe,
+        )
+    deviation = math.sqrt(variance)
+    skewness = sum((value - mean) ** 3 for value in returns) / count / deviation ** 3
+    kurtosis = sum((value - mean) ** 4 for value in returns) / count / deviation ** 4
+    sharpe = mean / deviation * math.sqrt(annualization)
+    return deflated_sharpe_probability(
+        sharpe, count, trials, skewness=skewness, kurtosis=kurtosis,
+        annualization=annualization, minimum_sharpe=minimum_sharpe,
+    )
 
 
 def bootstrap_ci(xs: Sequence[float], n_boot: int = 4000, seed: int = 1, alpha: float = 0.05) -> Tuple[float, float]:
@@ -18,14 +126,16 @@ def bootstrap_ci(xs: Sequence[float], n_boot: int = 4000, seed: int = 1, alpha: 
     return means[int(n_boot * alpha / 2)], means[int(n_boot * (1 - alpha / 2)) - 1]
 
 
-def trade_equity_curve(trades, initial_equity: float):
+def trade_equity_curve(trades, initial_equity: float, calendar_days: Sequence | None = None):
     """Build a realized, end-of-day equity curve when replay marks are unavailable."""
     daily_pnl = defaultdict(float)
     for trade in trades:
         daily_pnl[trade.exit_ts.astimezone(NY).date()] += trade.pnl_net
     equity = initial_equity
     curve = []
-    for day, pnl in sorted(daily_pnl.items()):
+    days = sorted(set(calendar_days)) if calendar_days is not None else sorted(daily_pnl)
+    for day in days:
+        pnl = daily_pnl.get(day, 0.0)
         equity += pnl
         curve.append((day, equity))
     return curve

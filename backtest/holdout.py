@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from backtest.data import load_dir
-from backtest.engine import BTConfig, run_backtest
+from backtest.engine import BTConfig, SignalFn, run_backtest
 from backtest.metrics import summarize, trade_equity_curve
 from backtest.walkforward import apply_params
 
@@ -25,6 +25,7 @@ def validate_final_holdout(
     candidate_id: str,
     directory: Path = FINAL_HOLDOUT_DIR,
     ledger_path: Path | None = None,
+    signal_fn: SignalFn | None = None,
 ) -> dict[str, Any]:
     """Load the isolated holdout only after parameters are frozen; never tune on its results."""
     expected_files = [directory / f"{symbol}.csv" for symbol in symbols]
@@ -103,7 +104,12 @@ def validate_final_holdout(
         temp.write_text(json.dumps(ledger, indent=2), encoding="utf-8")
         temp.replace(ledger_path)
         return result
-    result = run_backtest(data, apply_params(base, params))
+    config = apply_params(base, params)
+    result = (
+        run_backtest(data, config)
+        if signal_fn is None
+        else run_backtest(data, config, signal_fn=signal_fn)
+    )
     metrics = summarize(
         result.trades, trade_equity_curve(result.trades, base.initial_equity),
         base.initial_equity,

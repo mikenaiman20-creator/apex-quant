@@ -8,13 +8,15 @@ Approximation: sizing/position interplay is continuous across folds, which is fi
 from __future__ import annotations
 
 import itertools
+import math
 import os
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import replace
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 from backtest.data import MinuteBar, NY
-from backtest.engine import BTConfig, BTResult, TradeRecord, run_backtest
+from backtest.engine import BTConfig, BTResult, SignalFn, TradeRecord, run_backtest
 
 DEFAULT_GRID = {
     "min_signal_score": [0.65, 0.75],
@@ -35,8 +37,8 @@ def apply_params(cfg: BTConfig, params: Dict[str, float]) -> BTConfig:
 
 
 def _run(args) -> Tuple[Tuple, List[TradeRecord]]:
-    key, data, cfg = args
-    return key, run_backtest(data, cfg).trades
+    key, data, cfg, signal_fn = args
+    return key, run_backtest(data, cfg, signal_fn).trades
 
 
 def _mean_r(trades: List[TradeRecord]) -> float:
@@ -57,19 +59,61 @@ def _quality(trades: List[TradeRecord]) -> float:
     return 0.5 * min(profit_factor, 3.0) / 3.0 + 0.3 * win_rate + 0.2 * min(mean_r, 1.0)
 
 
-def walk_forward(data: Dict[str, List[MinuteBar]], base: BTConfig, grid=None, train_days: int = 60,
-                 test_days: int = 20, min_train_trades: int = 20, workers: int = 0,
-                 min_positive_train: bool = True):
+def parameter_grid_size(grid) -> int:
+    if not grid or any(not values for values in grid.values()):
+        raise ValueError("Parameter grid must contain non-empty parameter values.")
+    return math.prod(len(values) for values in grid.values())
+
+
+def run_parameter_grid(data: Dict[str, List[MinuteBar]], base: BTConfig, grid=None,
+                       workers: int = 0, signal_fn: SignalFn | None = None,
+                       trial_cycle_id: str | None = None,
+                       trial_ledger_path: Path | None = None,
+                       ) -> dict[Tuple, List[TradeRecord]]:
+    """Run each unique parameter combination once and return its full-history trades."""
     grid = grid or DEFAULT_GRID
     names = list(grid)
-    combos = list(itertools.product(*[grid[n] for n in names]))
-    jobs = [(c, data, apply_params(base, dict(zip(names, c)))) for c in combos]
+    if not names or any(not values for values in grid.values()):
+        raise ValueError("Parameter grid must contain non-empty parameter values.")
+    combos = list(itertools.product(*[grid[name] for name in names]))
+    if len(set(combos)) != len(combos):
+        raise ValueError("Parameter grid contains duplicate parameter combinations.")
     workers = workers or min(4, os.cpu_count() or 1)
+    if workers < 1:
+        raise ValueError("workers must be positive.")
+    if trial_cycle_id:
+        from server.evolution import TRIAL_LEDGER_PATH, register_trials
+
+        register_trials(
+            trial_cycle_id,
+            len(combos),
+            trial_ledger_path or TRIAL_LEDGER_PATH,
+        )
+    jobs = [
+        (combo, data, apply_params(base, dict(zip(names, combo))), signal_fn)
+        for combo in combos
+    ]
     if workers > 1 and len(jobs) > 1:
-        with ProcessPoolExecutor(max_workers=workers) as ex:
-            results = dict(ex.map(_run, jobs))
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            results = dict(executor.map(_run, jobs))
     else:
-        results = dict(_run(j) for j in jobs)
+        results = dict(_run(job) for job in jobs)
+    return results
+
+
+def walk_forward(data: Dict[str, List[MinuteBar]], base: BTConfig, grid=None, train_days: int = 60,
+                 test_days: int = 20, min_train_trades: int = 20, workers: int = 0,
+                 min_positive_train: bool = True,
+                 results: dict[Tuple, List[TradeRecord]] | None = None,
+                 signal_fn: SignalFn | None = None,
+                 trial_cycle_id: str | None = None,
+                 trial_ledger_path: Path | None = None):
+    grid = grid or DEFAULT_GRID
+    names = list(grid)
+    results = results if results is not None else run_parameter_grid(
+        data, base, grid=grid, workers=workers, signal_fn=signal_fn,
+        trial_cycle_id=trial_cycle_id, trial_ledger_path=trial_ledger_path,
+    )
 
     days = sorted({b.ts.astimezone(NY).date() for bars in data.values() for b in bars})
     folds, oos = [], []
@@ -87,19 +131,34 @@ def walk_forward(data: Dict[str, List[MinuteBar]], base: BTConfig, grid=None, tr
             if quality > best_val:
                 best_key, best_val, best_n = key, quality, len(train_trades)
                 best_train_trades = train_trades
+        fold = {
+            "train": f"{min(tr)}..{max(tr)}",
+            "test": f"{min(te)}..{max(te)}",
+            "test_days": sorted(te),
+            "selected": best_key is not None,
+            "params": dict(zip(names, best_key)) if best_key is not None else None,
+            "train_meanR": _mean_r(best_train_trades) if best_key is not None else float("nan"),
+            "train_quality": best_val if best_key is not None else float("nan"),
+            "train_n": best_n,
+            "test_meanR": float("nan"),
+            "test_n": 0,
+            "test_win_rate": float("nan"),
+            "test_profit_factor": float("nan"),
+        }
         if best_key is not None:
             test_trades = [t for t in results[best_key] if t.entry_ts.astimezone(NY).date() in te]
             oos.extend(test_trades)
             test_wins = [t for t in test_trades if t.pnl_net > 0]
             test_losses = [-t.pnl_net for t in test_trades if t.pnl_net < 0]
-            folds.append({
-                "train": f"{min(tr)}..{max(tr)}", "test": f"{min(te)}..{max(te)}",
-                "params": dict(zip(names, best_key)), "train_meanR": _mean_r(best_train_trades),
-                "train_quality": best_val, "train_n": best_n,
-                "test_meanR": _mean_r(test_trades) if test_trades else float("nan"), "test_n": len(test_trades),
+            fold.update({
+                "test_meanR": _mean_r(test_trades) if test_trades else float("nan"),
+                "test_n": len(test_trades),
                 "test_win_rate": len(test_wins) / len(test_trades) if test_trades else float("nan"),
-                "test_profit_factor": (sum(t.pnl_net for t in test_trades if t.pnl_net > 0) /
-                                       sum(test_losses)) if test_losses else float("nan"),
+                "test_profit_factor": (
+                    sum(t.pnl_net for t in test_trades if t.pnl_net > 0) /
+                    sum(test_losses) if test_losses else float("nan")
+                ),
             })
+        folds.append(fold)
         i += test_days
     return folds, oos, results

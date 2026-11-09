@@ -9,16 +9,33 @@
    directory). Use the exact names `ALPACA_API_KEY` and `ALPACA_API_SECRET`.
 5. To download data (free IEX feed):
      python -m backtest.cli fetch --symbols SPY QQQ NVDA --start 2024-01-01 --end 2026-09-30 --out data
-6. Run the walk-forward evaluation on existing CSV files (no API keys required):
+6. Run the purged combinatorial validation on existing CSV files (no API keys required):
      python -m backtest.cli run --csv-dir data --symbols SPY QQQ NVDA --walk-forward
    `--csv-dir data --symbols SPY QQQ NVDA` are also the defaults, so
      python -m backtest.cli run
-   runs a single full-history evaluation and matched random-entry baseline from those local files.
+   runs CPCV/DSR plus a full-history evaluation and matched random-entry baseline from those
+   local files. CPCV defaults to six chronological groups, three test groups per split, and a
+   one-session post-test embargo; boundary-crossing trades are purged and portfolio equity is
+   reset at each group boundary. Every invocation adds the number of tested parameter variants
+   to `logs/strategy_trial_ledger.json`, and DSR uses that cumulative trial count.
    Add `--walk-forward-only` to skip the full-history and random-entry replays and run only the
-   parameter-selection folds plus out-of-sample report. The output includes expectancy in R,
-   win rate, profit factor, maximum drawdown, and CAGR.
+   parameter-selection folds plus out-of-sample report. Every run prints PBO, DSR probability,
+   current and cumulative trial counts, and whether the CPCV/DSR gates passed. The output also
+   includes expectancy in R, win rate, profit factor, maximum drawdown, and CAGR. Change
+   `--cpcv-groups` or `--cpcv-embargo-days` only for a documented research design; all CPCV
+   settings are included in the report.
    For this dataset, the shorter OOS-only invocation is:
      python -m backtest.cli run --csv-dir data --symbols SPY QQQ NVDA --walk-forward-only --workers 8
+   The independent opening-range breakout sleeve uses a prior-20-bar 1.5x relative-volume
+   gate, a 14-minute ATR regime above its same-time 10-session average, and a trailing stop
+   activated at +1R and spaced at half the opening-range width. Its intentionally coarse
+   two-value reward/risk grid is evaluated through the same cost-aware CPCV/DSR and
+   walk-forward path:
+     python -m backtest.cli run --csv-dir data --symbols SPY QQQ NVDA --strategy orb --walk-forward-only
+   The independent short-term mean-reversion sleeve can be tested using its rolling 20-bar
+   close z-score (entry at |z| >= 2.0), synchronized SPY panic gate, next-bar fills and
+   mandatory same-day liquidation:
+     python -m backtest.cli run --csv-dir data --symbols SPY QQQ NVDA --strategy zscore --walk-forward-only
    (Windows: use `py` instead of `python` if `python` is not found.)
 Sanity check with no keys needed:
      python -m backtest.cli run --synthetic --symbols SPY --days 160
@@ -37,10 +54,12 @@ premarket volume and relative volume, and current bid/ask spread, then ranks the
 Liquidity thresholds and basket size are configurable through `.env.example`.
 
 The daily optimizer downloads recent 1-minute history for the top three selected symbols and runs
-the existing walk-forward engine. It records selected parameters and OOS diagnostics in
+the walk-forward and purged combinatorial validation engines. It records selected parameters,
+PBO, DSR, and OOS diagnostics in
 `logs/daily_profile.json`, but never applies a newly optimized profile automatically. Candidate
 variants are recorded in `logs/strategy_trial_ledger.json` and must pass a multiple-testing-adjusted
-Sharpe hurdle, the statistical gates, and a final blind holdout before being written to
+Sharpe hurdle, PBO below 0.20, DSR probability of at least 0.95, the statistical gates, and a
+final blind holdout before being written to
 `data/staging/`. The isolated holdout is read only by its one-candidate validator after parameters
 are frozen; it is never passed into walk-forward optimization. Existing `data/*.csv` history is not
 considered blind and will not be used as a substitute. Until genuinely untouched files are supplied
@@ -61,9 +80,25 @@ prompted. This records approval in
 does not enable live trading. A given holdout file set is evaluated at most once; a later candidate
 requires a genuinely new, untouched holdout dataset. Backtest costs default to a 1 bp minimum slippage, an additional
 0.1-ATR slippage component, $0.0035/share commission with a $0.35 minimum, and 0.3 bps sell-side
-fees. Override via `BACKTEST_SLIPPAGE_BPS`, `BACKTEST_SLIPPAGE_ATR_MULT`,
+fees. CLI validation additionally charges a 2 bps quoted spread (half-spread on each fill).
+Override with `--spread-bps` (or zero to omit quoted spread). Override other costs via
+`BACKTEST_SLIPPAGE_BPS`, `BACKTEST_SLIPPAGE_ATR_MULT`,
 `BACKTEST_COMMISSION_PER_SHARE`, `BACKTEST_COMMISSION_MIN`, and `BACKTEST_SELL_FEE_BPS`.
-ORB is not part of the current strategy and is therefore not claimed as an optimized parameter.
+The default `alpha` strategy remains unchanged. `--strategy orb` evaluates a separate
+research-only 15-minute opening-range breakout signal on the requested equities; it is not
+wired into the autonomous runner or any order-routing path. CPCV and walk-forward parameter
+replays include its two-value reward/risk grid and cumulative trial count. The volume and
+volatility gates and opening-range-width trail are fixed research features, not optimizable
+parameters in this deliberately coarsened search. The intraday ATR baseline is the prior ten
+valid sessions' 14-bar ATR at the same minute of the session; incomplete opening ranges and
+missing bars invalidate the corresponding observations.
+`server.portfolio_allocation.build_equal_risk_plan` produces a static capped equal-risk report
+for strategy sleeves and their assets (default: SPY, QQQ, NVDA). A sleeve receives a research
+budget only after CPCV PBO/DSR, positive walk-forward expectancy and P&L after costs, locked
+holdout, and cost-calibration gates pass; otherwise its budget is zero. The portfolio cap defaults
+to 0.5% total risk (0.25% per sleeve for two sleeves, evenly
+split across that sleeve's assets). The report always sets execution risk to zero, keeps dynamic
+weights disabled, and cannot authorize orders.
 Volume delta is approximated from OHLCV bars; live order-book imbalance is unavailable through this
 polling feed.
 
@@ -82,6 +117,16 @@ rotating logs at `logs/autonomous.log`. Each evaluated setup logs RVOL, ADX, ATR
 risk/reward, and acceptance/rejection reason; the latest scan is included in
 `logs/runner_heartbeat.json` for dashboard display. The heartbeat refresh thread updates every
 15 seconds, including during long synchronous optimization/API calls and market-closed waits.
+The read-only Streamlit monitor consumes `logs/market_dashboard_snapshot.json` for SPY/QQQ/NVDA
+quote cards, intraday closes, ATR/BBWP, and 50-day trend; it never fetches market data itself.
+Its CPCV page displays persisted split results and an interactive threshold comparison that does
+not rerun validation or alter promotion gates. The Local RAG assistant retrieves from mounted
+Python source, allowlisted reports, strategy files, and bounded log tails. To enable local model
+generation, set `APEX_UI_OLLAMA_URL` to an Ollama endpoint reachable only on the private host or
+Docker network and optionally set `APEX_UI_OLLAMA_MODEL` (default
+`qwen2.5-coder:1.5b`). The dashboard rejects public Ollama URLs and falls back to local evidence
+excerpts when generation is not configured or unavailable. No paid API or embedding service is
+used. Crypto market cards appear only when `CRYPTO_SYMBOLS` is explicitly configured.
 Entries additionally require daily and hourly SMA20/50/200 alignment and ADX strength, with
 completed 5-minute and 15-minute trend confirmation. Missing higher-timeframe history rejects
 the signal instead of silently bypassing the filter. The research state publishes matching daily

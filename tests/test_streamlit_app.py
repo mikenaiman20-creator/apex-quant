@@ -14,22 +14,95 @@ def _app_test(path: Path):
 def test_streamlit_dashboard_shows_sections_even_without_telemetry(monkeypatch):
     root = Path(__file__).parents[1]
     monkeypatch.setenv("APEX_DATA_ROOT", str(root / "missing-production-data"))
+    monkeypatch.setenv("APEX_SOURCE_ROOT", str(root / "missing-production-source"))
     app = _app_test(root / "app.py")
 
     assert not app.exception
     assert [item.value for item in app.title] == ["Apex Quant"]
     assert {item.label for item in app.tabs} == {
-        "Overview", "Trading", "Research", "Strategy validation", "Activity",
+        "◈ Overview",
+        "⚡ Execution Engine",
+        "⌕ Research & Strategy Arsenal",
+        "◉ CPCV / DSR Validation",
+        "✦ Apex Quant Assistant (RAG)",
+        "☷ Activity",
     }
     assert any("Production telemetry is not mounted" in item.value for item in app.error)
+    assert any(
+        item.value.startswith("One or more project modules are missing")
+        for item in app.warning
+    )
+
+
+def test_streamlit_dashboard_uses_placeholders_for_unpublished_snapshots(
+    monkeypatch, tmp_path,
+):
+    root = Path(__file__).parents[1]
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "data").mkdir()
+    (tmp_path / "logs" / "runner_heartbeat.json").write_text(json.dumps({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "status": "active",
+        "symbols": ["SPY", "QQQ", "NVDA"],
+    }), encoding="utf-8")
+    source = tmp_path / "source"
+    for module in ("backtest", "config", "engine", "server"):
+        (source / module).mkdir(parents=True)
+    monkeypatch.setenv("APEX_DATA_ROOT", str(tmp_path))
+    monkeypatch.setenv("APEX_SOURCE_ROOT", str(source))
+    app = _app_test(root / "app.py")
+
+    assert not app.exception
+    assert not app.error, [item.value for item in app.error]
+    assert any("snapshots have not been published yet" in item.value for item in app.info)
+    assert any("No daily strategy profile is available." in item.value for item in app.info)
+    assert any("No researcher state has been published." in item.value for item in app.info)
+    assert any("No strategy audit report is available." in item.value for item in app.info)
+
+
+def test_streamlit_rag_chat_returns_local_evidence_when_ollama_is_unavailable(
+    monkeypatch, tmp_path,
+):
+    root = Path(__file__).parents[1]
+    logs = tmp_path / "logs"
+    data = tmp_path / "data"
+    source = tmp_path / "source"
+    logs.mkdir()
+    data.mkdir()
+    for module in ("backtest", "config", "engine", "server"):
+        (source / module).mkdir(parents=True)
+    (source / "backtest" / "validation.py").write_text(
+        "CPCV requires PBO below the configured DSR gate.\n",
+        encoding="utf-8",
+    )
+    (logs / "runner_heartbeat.json").write_text(json.dumps({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "status": "active",
+        "symbols": ["SPY"],
+    }), encoding="utf-8")
+    monkeypatch.setenv("APEX_DATA_ROOT", str(tmp_path))
+    monkeypatch.setenv("APEX_SOURCE_ROOT", str(source))
+    monkeypatch.delenv("APEX_UI_OLLAMA_URL", raising=False)
+    app = _app_test(root / "app.py")
+    assert not app.exception
+    assert len(app.chat_input) == 1
+
+    app.chat_input[0].set_value("CPCV PBO DSR").run(timeout=30)
+
+    assert not app.exception
+    assert any("Ollama is not configured" in item.value for item in app.markdown)
+    assert any("validation.py" in item.value for item in app.caption)
 
 
 def test_streamlit_dashboard_renders_published_paper_research_data(monkeypatch, tmp_path):
     root = tmp_path
     logs = root / "logs"
     data = root / "data"
+    source = root / "source"
     logs.mkdir()
     data.mkdir()
+    for module in ("backtest", "config", "engine", "server"):
+        (source / module).mkdir(parents=True)
     (logs / "runner_heartbeat.json").write_text(json.dumps({
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "status": "active",
@@ -43,6 +116,32 @@ def test_streamlit_dashboard_renders_published_paper_research_data(monkeypatch, 
         "account": {"equity": "25000", "cash": "12000", "buying_power": "48000"},
         "positions": [{"symbol": "SPY", "qty": "2", "side": "long"}],
         "orders": [{"symbol": "SPY", "side": "buy", "status": "filled"}],
+    }), encoding="utf-8")
+    (logs / "market_dashboard_snapshot.json").write_text(json.dumps({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "symbols": {
+            "SPY": {
+                "asset_class": "equity",
+                "display_symbol": "SPY",
+                "price": 600,
+                "trend_50d": "above",
+                "sma50": 590,
+                "atr_pct": 0.5,
+                "bbwp": 12,
+                "regime": "above 50-day trend · volatility squeeze",
+                "candles": [
+                    {"time": "2026-11-07T14:30:00+00:00", "close": 599},
+                    {"time": "2026-11-07T14:31:00+00:00", "close": 600},
+                ],
+            },
+            "BTC/USD": {
+                "asset_class": "crypto",
+                "display_symbol": "BTC-USD",
+                "price": 90000,
+                "regime": "24/7 · order routing disabled",
+                "candles": [],
+            },
+        },
     }), encoding="utf-8")
     (logs / "daily_profile.json").write_text(json.dumps({
         "universe": ["SPY"],
@@ -111,6 +210,7 @@ def test_streamlit_dashboard_renders_published_paper_research_data(monkeypatch, 
     connection.close()
 
     monkeypatch.setenv("APEX_DATA_ROOT", str(root))
+    monkeypatch.setenv("APEX_SOURCE_ROOT", str(source))
     app = _app_test(Path(__file__).parents[1] / "app.py")
 
     assert not app.exception
@@ -121,3 +221,9 @@ def test_streamlit_dashboard_renders_published_paper_research_data(monkeypatch, 
         for item in app.metric
     )
     assert any(item.label == "SQLite integrity" and item.value == "OK" for item in app.metric)
+    assert any(item.label == "SPY" and item.value == "$600.00" for item in app.metric)
+    assert any(item.label == "BTC-USD" and item.value == "$90,000.00" for item in app.metric)
+    assert not any(
+        item.value.startswith("One or more project modules are missing")
+        for item in app.warning
+    )

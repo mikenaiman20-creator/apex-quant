@@ -71,11 +71,14 @@ def test_trial_ledger_repairs_invalid_and_legacy_schemas(tmp_path: Path):
 
     repaired = load_trial_ledger(ledger_path)
     persisted = json.loads(ledger_path.read_text(encoding="utf-8"))
-    assert repaired == {"version": 1, "cycles": {}, "total_trials": 0}
+    assert repaired == {
+        "version": 1, "cycles": {}, "num_trials": 0, "total_trials": 0,
+    }
     assert persisted == repaired
 
     ledger_path.write_text('{"total_trials": 12}', encoding="utf-8")
     legacy = load_trial_ledger(ledger_path)
+    assert legacy["num_trials"] == 12
     assert legacy["total_trials"] == 12
     assert legacy["cycles"] == {"legacy_import": 12}
     assert json.loads(ledger_path.read_text(encoding="utf-8")) == legacy
@@ -90,7 +93,9 @@ def test_dashboard_normalizes_corrupt_trial_ledger_without_failing(tmp_path: Pat
     data = DashboardState(
         tmp_path, client_factory=lambda: (_ for _ in ()).throw(RuntimeError("offline"))
     ).snapshot()
-    assert data["trial_ledger"] == {"version": 1, "cycles": {}, "total_trials": 0}
+    assert data["trial_ledger"] == {
+        "version": 1, "cycles": {}, "num_trials": 0, "total_trials": 0,
+    }
     assert json.loads((logs / "strategy_trial_ledger.json").read_text(encoding="utf-8")) == data["trial_ledger"]
 
 

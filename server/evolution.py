@@ -4,12 +4,15 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import re
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from statistics import NormalDist
 from pathlib import Path
 from typing import Any
+
+from backtest.metrics import deflated_sharpe_probability
 
 log = logging.getLogger("apex.evolution")
 ROOT = Path(__file__).resolve().parents[1]
@@ -63,10 +66,10 @@ SEED_ARSENAL = {
 def normalize_trial_ledger(value: Any) -> dict[str, Any]:
     """Return a valid ledger, preserving usable counts from older ledger shapes."""
     if not isinstance(value, dict):
-        return {"version": 1, "cycles": {}, "total_trials": 0}
+        return {"version": 1, "cycles": {}, "num_trials": 0, "total_trials": 0}
     raw_cycles = value.get("cycles")
     if raw_cycles is not None and not isinstance(raw_cycles, dict):
-        return {"version": 1, "cycles": {}, "total_trials": 0}
+        return {"version": 1, "cycles": {}, "num_trials": 0, "total_trials": 0}
     cycles: dict[str, int] = {}
     if isinstance(raw_cycles, dict):
         for cycle_id, count in raw_cycles.items():
@@ -77,7 +80,7 @@ def normalize_trial_ledger(value: Any) -> dict[str, Any]:
                 and count >= 0
             ):
                 cycles[cycle_id] = count
-    legacy_total = value.get("total_trials")
+    legacy_total = value.get("num_trials", value.get("total_trials"))
     if (
         not cycles
         and isinstance(legacy_total, int)
@@ -88,6 +91,7 @@ def normalize_trial_ledger(value: Any) -> dict[str, Any]:
     result = {
         "version": 1,
         "cycles": cycles,
+        "num_trials": sum(cycles.values()),
         "total_trials": sum(cycles.values()),
     }
     recent_win_rates = value.get("recent_win_rates")
@@ -116,20 +120,96 @@ def normalize_trial_ledger(value: Any) -> dict[str, Any]:
     return result
 
 
-def load_trial_ledger(path: Path = TRIAL_LEDGER_PATH) -> dict[str, Any]:
-    """Load and repair the local ledger under the same lock used by its writers."""
-    with _trial_ledger_lock:
-        exists = True
+@contextmanager
+def _trial_ledger_file_lock(path: Path):
+    """Serialize ledger updates across CLI and worker processes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f"{path.name}.lock")
+    with lock_path.open("a+b") as lock_file:
+        lock_file.seek(0, os.SEEK_END)
+        if lock_file.tell() == 0:
+            lock_file.write(b"0")
+            lock_file.flush()
+        lock_file.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            exists = False
-            raw = None
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            log.warning("Invalid strategy trial ledger; reinitializing %s.", path)
-            raw = None
-        ledger = normalize_trial_ledger(raw)
-        if exists and raw != ledger:
+            yield
+        finally:
+            lock_file.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _read_trial_ledger(path: Path, *, strict: bool) -> dict[str, Any]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raw = None
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        if strict:
+            raise ValueError(f"Trial ledger is invalid; refusing to reset trial history: {path}") from exc
+        log.warning("Invalid strategy trial ledger; reinitializing %s.", path)
+        raw = None
+
+    if strict and raw is not None:
+        if not isinstance(raw, dict):
+            raise ValueError(f"Trial ledger has an invalid schema: {path}")
+        cycles = raw.get("cycles")
+        if cycles is not None and (
+            not isinstance(cycles, dict)
+            or any(
+                not isinstance(cycle_id, str)
+                or not isinstance(count, int)
+                or isinstance(count, bool)
+                or count < 0
+                for cycle_id, count in cycles.items()
+            )
+        ):
+            raise ValueError(f"Trial ledger has invalid cycle counts: {path}")
+        totals = [
+            raw[key] for key in ("num_trials", "total_trials") if key in raw
+        ]
+        if any(
+            not isinstance(total, int) or isinstance(total, bool) or total < 0
+            for total in totals
+        ):
+            raise ValueError(f"Trial ledger has an invalid total: {path}")
+        if len(totals) == 2 and totals[0] != totals[1]:
+            raise ValueError(f"Trial ledger cumulative totals disagree: {path}")
+        total = totals[0] if totals else None
+        if cycles is None and total is None:
+            raise ValueError(f"Trial ledger has no trial counts: {path}")
+        if isinstance(cycles, dict) and total is not None and cycles:
+            if total != sum(cycles.values()):
+                raise ValueError(f"Trial ledger total does not match its cycles: {path}")
+
+    return normalize_trial_ledger(raw)
+
+
+def load_trial_ledger(path: Path = TRIAL_LEDGER_PATH, *, strict: bool = False) -> dict[str, Any]:
+    """Load the trial ledger; strict mode refuses to discard or reset trial history."""
+    with _trial_ledger_lock, _trial_ledger_file_lock(path):
+        existed = path.exists()
+        ledger = _read_trial_ledger(path, strict=strict)
+        if strict:
+            return ledger
+        if existed:
+            try:
+                original = json.loads(path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                original = None
+        else:
+            original = None
+        if existed and original != ledger:
             path.parent.mkdir(parents=True, exist_ok=True)
             temp = path.with_suffix(".json.tmp")
             temp.write_text(json.dumps(ledger, indent=2), encoding="utf-8")
@@ -148,66 +228,55 @@ def _finite_number(value: Any) -> float | None:
 def register_trials(cycle_id: str, trial_count: int,
                     path: Path = TRIAL_LEDGER_PATH,
                     win_rate_records: list[dict[str, Any]] | None = None) -> int:
-    """Persist unique discovery-cycle trial counts and return the cumulative count."""
-    if not cycle_id or trial_count < 0:
-        raise ValueError("A cycle ID and non-negative trial count are required.")
-    with _trial_ledger_lock:
-        try:
-            ledger = json.loads(path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            ledger = None
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            log.warning("Invalid strategy trial ledger JSON; reinitializing %s.", path)
-            ledger = None
-        ledger = normalize_trial_ledger(ledger)
+    """Persist unique sweep counts, including failed sweeps reserved before execution."""
+    if not cycle_id or not isinstance(trial_count, int) or isinstance(trial_count, bool) or trial_count < 0:
+        raise ValueError("A cycle ID and non-negative integer trial count are required.")
+    with _trial_ledger_lock, _trial_ledger_file_lock(path):
+        ledger = _read_trial_ledger(path, strict=True)
         cycles = ledger["cycles"]
         if cycle_id not in cycles:
             cycles[cycle_id] = trial_count
-            ledger["total_trials"] = sum(cycles.values())
-            valid_records = []
-            for record in win_rate_records or []:
-                if not isinstance(record, dict):
-                    continue
-                win_rate = _finite_number(record.get("win_rate"))
-                trade_count = record.get("trade_count")
-                if (
-                    win_rate is not None and 0 <= win_rate <= 1
-                    and isinstance(trade_count, int)
-                    and not isinstance(trade_count, bool) and trade_count > 0
-                ):
-                    valid_records.append({
-                        "cycle_id": cycle_id,
-                        "win_rate": win_rate,
-                        "trade_count": trade_count,
-                    })
-            if valid_records:
-                samples = ledger.get("recent_win_rates", [])
-                ledger["recent_win_rates"] = (samples + valid_records)[-142:]
+        ledger["num_trials"] = sum(cycles.values())
+        ledger["total_trials"] = ledger["num_trials"]
+        valid_records = []
+        for record in win_rate_records or []:
+            if not isinstance(record, dict):
+                continue
+            win_rate = _finite_number(record.get("win_rate"))
+            trade_count = record.get("trade_count")
+            if (
+                win_rate is not None and 0 <= win_rate <= 1
+                and isinstance(trade_count, int)
+                and not isinstance(trade_count, bool) and trade_count > 0
+            ):
+                valid_records.append({
+                    "cycle_id": cycle_id,
+                    "win_rate": win_rate,
+                    "trade_count": trade_count,
+                })
+        if valid_records:
+            samples = ledger.get("recent_win_rates", [])
+            samples = [sample for sample in samples if sample.get("cycle_id") != cycle_id]
+            ledger["recent_win_rates"] = (samples + valid_records)[-142:]
         ledger["last_updated_at"] = datetime.now(timezone.utc).isoformat()
         ledger["latest_cycle_id"] = cycle_id
         path.parent.mkdir(parents=True, exist_ok=True)
         temp = path.with_suffix(".json.tmp")
         temp.write_text(json.dumps(ledger, indent=2), encoding="utf-8")
         temp.replace(path)
-        return int(ledger.get("total_trials", sum(int(value) for value in cycles.values())))
+        return int(ledger["num_trials"])
 
 
 def update_trial_activity(cycle_id: str, trial_count: int, status: str, message: str,
                           path: Path = TRIAL_LEDGER_PATH) -> dict[str, Any]:
     """Publish the research worker's current task alongside cumulative trial counts."""
-    with _trial_ledger_lock:
-        try:
-            ledger = json.loads(path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            ledger = None
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            log.warning("Invalid strategy trial ledger JSON; reinitializing %s.", path)
-            ledger = None
-        ledger = normalize_trial_ledger(ledger)
+    with _trial_ledger_lock, _trial_ledger_file_lock(path):
+        ledger = _read_trial_ledger(path, strict=True)
         cycles = ledger["cycles"]
         if cycle_id and cycle_id not in cycles and status == "completed":
             cycles[cycle_id] = trial_count
-        ledger["total_trials"] = sum(cycles.values())
+        ledger["num_trials"] = sum(cycles.values())
+        ledger["total_trials"] = ledger["num_trials"]
         ledger["latest_activity"] = {
             "cycle_id": cycle_id,
             "status": status,
@@ -255,39 +324,37 @@ def update_audit_research_activity(
 
 
 def deflated_sharpe(sharpe: float | None, observations: int,
-                    n_trials: int) -> dict[str, float | int | bool | None]:
-    """Approximate a multiple-testing-adjusted Sharpe significance hurdle."""
+                    n_trials: int, skewness: float = 0.0,
+                    kurtosis: float = 3.0) -> dict[str, float | int | bool | None]:
+    """Apply the Deflated Sharpe Ratio with an all-trials multiple-testing correction."""
     value = _finite_number(sharpe)
-    trials = max(int(n_trials), 1)
-    n_obs = max(int(observations), 1)
-    if value is None or n_obs < 2:
-        return {
-            "raw_sharpe": value, "adjusted_sharpe": None,
-            "required_sharpe": None, "n_trials": trials,
-            "observations": n_obs, "passed": False,
-        }
-    standard_error = math.sqrt(252.0 / n_obs)
-    expected_max = (
-        NormalDist().inv_cdf(0.5 ** (1.0 / trials)) * standard_error
-        if trials > 1 else 0.0
+    return deflated_sharpe_probability(
+        value, observations, n_trials, skewness=skewness, kurtosis=kurtosis,
+        minimum_sharpe=BASE_SHARPE_HURDLE,
     )
-    required = max(BASE_SHARPE_HURDLE, expected_max + NormalDist().inv_cdf(0.95) * standard_error)
-    adjusted = NormalDist().cdf((value - expected_max) / standard_error)
-    return {
-        "raw_sharpe": value, "adjusted_sharpe": adjusted,
-        "required_sharpe": required, "n_trials": trials,
-        "observations": n_obs,
-        "passed": bool(value >= required and adjusted >= 0.95),
-    }
 
 
 def stage_candidate(candidate: dict[str, Any], holdout: dict[str, Any],
                     path: Path = AUDIT_PATH, staging_dir: Path = STAGING_DIR) -> dict[str, Any]:
     """Write an audit record and stage only a statistically and blindly validated candidate."""
+    trials = int(candidate.get("n_trials", 1))
+    cpcv = candidate.get("cpcv")
+    cpcv_dsr = cpcv.get("dsr") if isinstance(cpcv, dict) else None
+    cpcv_sharpe = _finite_number(
+        cpcv_dsr.get("raw_sharpe") if isinstance(cpcv_dsr, dict) else None
+    )
+    skewness = _finite_number(
+        cpcv_dsr.get("skewness") if isinstance(cpcv_dsr, dict) else None
+    )
+    kurtosis = _finite_number(
+        cpcv_dsr.get("kurtosis") if isinstance(cpcv_dsr, dict) else None
+    )
     sharpe_result = deflated_sharpe(
-        _finite_number(candidate.get("sharpe")),
-        int(candidate.get("observations", 0)),
-        int(candidate.get("n_trials", 1)),
+        cpcv_sharpe if cpcv_sharpe is not None else _finite_number(candidate.get("sharpe")),
+        int(cpcv_dsr.get("observations", 0)) if isinstance(cpcv_dsr, dict) else 0,
+        trials,
+        skewness if skewness is not None else 0.0,
+        kurtosis if kurtosis is not None else 3.0,
     )
     basic_gates = bool(
         int(candidate.get("paper_trades", 0)) >= 30
@@ -296,7 +363,20 @@ def stage_candidate(candidate: dict[str, Any], holdout: dict[str, Any],
         and float(candidate["max_drawdown_pct"]) < 5
     )
     holdout_passed = bool(holdout.get("available") and holdout.get("passed"))
-    passed = basic_gates and bool(sharpe_result["passed"]) and holdout_passed
+    pbo = _finite_number(cpcv.get("pbo")) if isinstance(cpcv, dict) else None
+    cpcv_passed = bool(
+        isinstance(cpcv, dict)
+        and cpcv.get("method") == "CPCV-CSCV"
+        and cpcv.get("n_trials") == trials
+        and int(cpcv.get("valid_splits", 0)) > 0
+        and cpcv.get("pbo_passed") is True
+        and pbo is not None and 0 <= pbo < 0.20
+        and sharpe_result["passed"]
+    )
+    passed = (
+        basic_gates and bool(sharpe_result["passed"])
+        and cpcv_passed and holdout_passed
+    )
     candidate_id = str(candidate.get("id") or "candidate")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", candidate_id):
         raise ValueError("Candidate ID must be a plain filename identifier.")
@@ -308,6 +388,10 @@ def stage_candidate(candidate: dict[str, Any], holdout: dict[str, Any],
         "deflated_sharpe_probability": sharpe_result["adjusted_sharpe"],
         "required_sharpe": sharpe_result["required_sharpe"],
         "sharpe_gate_passed": sharpe_result["passed"],
+        "pbo": pbo,
+        "pbo_gate_passed": pbo is not None and 0 <= pbo < 0.20,
+        "cpcv_gate_passed": cpcv_passed,
+        "cpcv": candidate.get("cpcv"),
         "basic_gates_passed": basic_gates,
         "holdout": holdout,
         "expected_slippage_drag": candidate.get("expected_slippage_drag"),

@@ -1,0 +1,31 @@
+[Unit]
+Description=Apex Quant fail-closed PAPER autonomous runner
+Requires=apex-risk-gateway-proxy.socket
+After=network-online.target apex-risk-gateway-proxy.socket
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/apex_quant
+EnvironmentFile=/home/ubuntu/apex_quant/deploy/phase2/risk-gate.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+ExecStartPre=/home/ubuntu/miniforge3/envs/apex_env/bin/python -m server.risk_engine check
+ExecStart=/home/ubuntu/miniforge3/envs/apex_env/bin/python -u -m server.autonomous_runner
+Restart=on-failure
+RestartSec=15
+TimeoutStartSec=60
+TimeoutStopSec=30
+KillSignal=SIGINT
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ReadWritePaths=/home/ubuntu/apex_quant/data /home/ubuntu/apex_quant/logs
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

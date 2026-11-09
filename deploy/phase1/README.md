@@ -13,8 +13,10 @@ host. Never run `docker compose down --volumes` for this stack.
 
 ## 1. Prepare Phase 1 values and network
 
-Copy this directory and the updated `app.py` and `server/autonomous_runner.py` to
+Copy this directory and the updated `app.py` and `server/paper_snapshot.py` to
 `/home/ubuntu/apex_quant`. Keep the running production `data/` and `logs/` directories intact.
+Use Compose project name `apex-project` for every command below; it preserves the existing
+`apex-project_chroma_data` named volume across the deployment.
 
 Append these values to the existing, permission-restricted
 `deploy/phase0/deployment.env`, replacing the Certbot image example with the verified ARM64
@@ -24,11 +26,18 @@ manifest digest:
 DASHBOARD_DOMAIN=151.145.93.209.nip.io
 CERTBOT_EMAIL=mikenaiman20@gmail.com
 CERTBOT_IMAGE=certbot/certbot@sha256:<verified-arm64-manifest-digest>
+APEX_RUNTIME_UID=1001
+APEX_RUNTIME_GID=1001
 ```
 
 The digest must identify an official Certbot image manifest that supports the OCI ARM64
 architecture. Keep `deployment.env` mode `600`. Existing verified Nginx, OAuth2 Proxy, Python,
 and Chroma image digests remain in that same file.
+Use Docker Compose v2.24.4 or newer; the Phase 1 overlay replaces the Phase 0 certificate mounts
+so the temporary ACME setup can start before a certificate exists.
+The Streamlit container runs as this unprivileged host UID/GID so it can read the mode-`700`
+production data and log directories without making those files world-readable. Verify the values
+against `id -u ubuntu` and `id -g ubuntu` before starting the stack.
 
 Resolve the hostname on the OCI host and confirm it returns `151.145.93.209`:
 
@@ -69,13 +78,13 @@ Start the temporary HTTP-only Nginx config, which serves ACME challenges and ret
 other paths while the certificate is being issued:
 
 ```bash
-docker compose --env-file deploy/phase0/deployment.env \
+docker compose -p apex-project --env-file deploy/phase0/deployment.env \
   -f deploy/phase0/docker-compose.yml \
   -f deploy/phase1/docker-compose.phase1.yml \
   -f deploy/phase1/docker-compose.acme.yml \
   up -d nginx
 
-docker compose --env-file deploy/phase0/deployment.env \
+docker compose -p apex-project --env-file deploy/phase0/deployment.env \
   -f deploy/phase0/docker-compose.yml \
   -f deploy/phase1/docker-compose.phase1.yml \
   -f deploy/phase1/docker-compose.acme.yml \
@@ -92,7 +101,7 @@ sudo test -s /etc/letsencrypt/live/151.145.93.209.nip.io/privkey.pem
 Start the authenticated HTTPS Nginx config and application:
 
 ```bash
-docker compose --env-file deploy/phase0/deployment.env \
+docker compose -p apex-project --env-file deploy/phase0/deployment.env \
   -f deploy/phase0/docker-compose.yml \
   -f deploy/phase1/docker-compose.phase1.yml \
   up -d --build
@@ -112,14 +121,15 @@ sudo systemctl enable --now apex-certbot-renew.timer
 sudo systemctl list-timers apex-certbot-renew.timer --no-pager
 ```
 
-The `ubuntu` service account must be able to access the Docker socket; verify with
-`sudo -u ubuntu docker info` before enabling the timer.
+The renewal systemd service runs as root to access the Docker socket without granting the
+`ubuntu` account broad Docker-group privileges. Verify Docker access with `sudo docker info`
+before enabling the timer.
 
 The timer runs `certbot renew` twice daily and reloads Nginx only after a successful renewal
 command. Check its first dry run without changing certificates:
 
 ```bash
-docker compose --env-file deploy/phase0/deployment.env \
+docker compose -p apex-project --env-file deploy/phase0/deployment.env \
   -f deploy/phase0/docker-compose.yml \
   -f deploy/phase1/docker-compose.phase1.yml \
   --profile certbot run --rm certbot renew --dry-run \
@@ -133,11 +143,11 @@ The Compose stack stores ChromaDB under the named `chroma_data` volume and maps 
 (`backtest/`, `config/`, `engine/`, `server/`) are also mounted read-only. Verify mounts:
 
 ```bash
-docker compose --env-file deploy/phase0/deployment.env \
+docker compose -p apex-project --env-file deploy/phase0/deployment.env \
   -f deploy/phase0/docker-compose.yml \
   -f deploy/phase1/docker-compose.phase1.yml \
   ps
-docker inspect "$(docker compose --env-file deploy/phase0/deployment.env \
+docker inspect "$(docker compose -p apex-project --env-file deploy/phase0/deployment.env \
   -f deploy/phase0/docker-compose.yml \
   -f deploy/phase1/docker-compose.phase1.yml ps -q chromadb)" \
   --format '{{json .Mounts}}'
@@ -149,31 +159,41 @@ Chroma remains on its own internal-only network and has no published host port. 
 Python backend described by CVE-2026-45829, or that the exact image is vendor-fixed. Isolation is
 not a software patch. Do not attach other services to its network or add a `ports:` mapping.
 
-## 6. Deploy the quantitative modules and verify telemetry
+## 6. Deploy sanitized PAPER telemetry
 
-Copy the updated `app.py` and `server/autonomous_runner.py` into the project directory. Streamlit
-reloads the read-only bind-mounted app script. Restart the actual autonomous runner service so it
-loads the sanitized PAPER snapshot writer; do not restart `apex_quant.service` unless you intend to
-run its separate oneshot backtest job. Identify the runner unit first:
+The paper snapshot service makes only GET requests to the Alpaca PAPER API. It refuses to run
+unless `TRADING_MODE=PAPER` and `BROKER=ALPACA`, publishes an allowlisted snapshot to `logs/`,
+and never gives broker credentials to Streamlit. It is not a trading runner and cannot place,
+replace, or cancel orders.
+
+Install the service and its once-per-minute timer:
 
 ```bash
-systemctl list-units --type=service --all --no-pager | grep -Ei 'apex|runner|unified|trading'
+sudo install -o root -g root -m 644 \
+  deploy/phase1/apex-paper-snapshot.service /etc/systemd/system/
+sudo install -o root -g root -m 644 \
+  deploy/phase1/apex-paper-snapshot.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl start apex-paper-snapshot.service
+sudo systemctl enable --now apex-paper-snapshot.timer
+sudo systemctl --no-pager status apex-paper-snapshot.service
+sudo systemctl list-timers apex-paper-snapshot.timer --no-pager
 ```
 
-After restarting the runner unit, verify:
+Verify the sanitized publication and local database integrity:
 
 ```bash
 python3 -c "import json,pathlib; p=pathlib.Path('logs/paper_dashboard_snapshot.json'); d=json.loads(p.read_text()); print(d['timestamp'], d['paper_api_status'], d['mode'], len(d['positions']), len(d['orders']))"
-sqlite3 -readonly data/knowledge_brain.sqlite 'PRAGMA quick_check;'
-docker compose --env-file deploy/phase0/deployment.env \
+python3 -c "import sqlite3; c=sqlite3.connect('file:data/knowledge_brain.sqlite?mode=ro',uri=True); print(c.execute('PRAGMA quick_check').fetchone()[0]); c.close()"
+docker compose -p apex-project --env-file deploy/phase0/deployment.env \
   -f deploy/phase0/docker-compose.yml \
   -f deploy/phase1/docker-compose.phase1.yml \
   exec -T streamlit python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health').read().decode())"
 ```
 
-The dashboard's Research tab also reports SQLite integrity and strategy/source counts. API
-connectivity is current only when `paper_api_status` is `connected` and the snapshot timestamp is
-recent; a stale snapshot is explicitly flagged.
+The Research tab reads the SQLite database read-only and displays strategy/source counts. The
+Trading tab reports account and order state only from the sanitized snapshot; stale data is
+explicitly flagged.
 
 ## 7. Acceptance checks
 

@@ -42,6 +42,8 @@ class Decision:
     qty: int = 0
     reject_reason: str = ""
     behavioral_story: str = ""
+    trail_distance: Optional[float] = None
+    trail_activation_r: float = 1.0
 
     def rationale(self) -> str:
         lines = [f"{c.name}: {'PASS' if c.passed else 'FAIL'} (w={c.weight:.2f}) {c.detail}" for c in self.checks]

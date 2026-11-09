@@ -3,3 +3,9 @@
 !deploy/
 !deploy/phase0/
 !deploy/phase0/requirements.txt
+!deploy/phase2/
+!deploy/phase2/Dockerfile
+!server/
+!server/__init__.py
+!server/reconciliation.py
+!server/risk_engine.py

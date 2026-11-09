@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import threading
 import time
 from datetime import datetime, time as datetime_time, timedelta, timezone
@@ -14,13 +15,24 @@ from engine.data_pipeline import Bar, Quote, SymbolState
 from server.autonomous_runner import (
     AlpacaClient, AutonomousRunner, _adx, _feed_bar, _opening_range_breakout,
     _relative_volume, load_crypto_symbols, load_paper_settings,
-    write_dashboard_paper_snapshot,
+    write_dashboard_market_snapshot, write_dashboard_paper_snapshot,
 )
 from engine.strategy import Check, Decision, Side
 from server.ingestion.brain import KnowledgeBrain
 from server.broker_adapters import AlpacaPaperAdapter
 
 NY = ZoneInfo("America/New_York")
+
+
+class ApprovingRiskGate:
+    def health(self):
+        return {"status": "ready", "heartbeat_at": time.time()}
+
+    def authorize(self, _request):
+        return {"approved": True, "reason": "test approval"}
+
+    def reconcile(self, _request):
+        return {"approved": True, "reason": "test reconciliation"}
 
 
 def test_runner_rejects_live_mode(monkeypatch):
@@ -32,6 +44,15 @@ def test_runner_rejects_live_mode(monkeypatch):
         load_paper_settings()
 
 
+def test_single_instance_lock_releases_only_a_lock_it_acquired(monkeypatch, tmp_path):
+    monkeypatch.setattr(runner_module, "ROOT", tmp_path)
+    lock_path = tmp_path / "logs" / "autonomous.lock"
+    with runner_module.single_instance_lock():
+        assert lock_path.exists()
+    with runner_module.single_instance_lock():
+        assert lock_path.exists()
+
+
 def test_runner_accepts_configured_universe_seed(monkeypatch):
     monkeypatch.setenv("TRADING_MODE", "PAPER")
     monkeypatch.setenv("BROKER", "ALPACA")
@@ -39,6 +60,33 @@ def test_runner_accepts_configured_universe_seed(monkeypatch):
     monkeypatch.setenv("ALPACA_API_SECRET", "test-secret")
     monkeypatch.setenv("WATCHLIST", "SPY,QQQ")
     assert load_paper_settings().watchlist == ("SPY", "QQQ")
+
+
+def test_runner_halts_before_broker_access_when_risk_heartbeat_is_unavailable(monkeypatch):
+    monkeypatch.setenv("TRADING_MODE", "PAPER")
+    monkeypatch.setenv("BROKER", "ALPACA")
+    monkeypatch.setenv("ALPACA_API_KEY", "test-key")
+    monkeypatch.setenv("ALPACA_API_SECRET", "test-secret")
+    settings = load_paper_settings()
+
+    class UnavailableRiskGate:
+        def health(self):
+            raise runner_module.RiskGateUnavailable("risk heartbeat unavailable")
+
+    class Broker:
+        called = False
+
+        def clock(self):
+            self.called = True
+            raise AssertionError("broker must not be contacted")
+
+    broker = Broker()
+    runner = AutonomousRunner(
+        settings, broker, risk_gate=UnavailableRiskGate(),
+    )
+    assert runner.run_once() == runner_module.POLL_SECONDS
+    assert runner.risk_gateway_halted is True
+    assert broker.called is False
 
 
 def test_order_routing_requires_explicit_enablement_and_promoted_brain_strategy(
@@ -95,11 +143,32 @@ def test_crypto_pair_configuration_is_validated(monkeypatch):
         load_crypto_symbols()
 
 
-def test_crypto_research_defaults_to_common_24_7_pairs(monkeypatch):
+def test_crypto_research_is_disabled_by_default(monkeypatch):
     monkeypatch.delenv("CRYPTO_SYMBOLS", raising=False)
-    assert load_crypto_symbols() == ("BTC/USD", "ETH/USD")
+    assert load_crypto_symbols() == ()
     monkeypatch.setenv("CRYPTO_SYMBOLS", "")
     assert load_crypto_symbols() == ()
+
+
+def test_bar_time_accepts_nanosecond_market_timestamps():
+    parsed = runner_module._bar_time("2026-11-08T18:21:00.788764427+00:00")
+    assert parsed == datetime(2026, 11, 8, 18, 21, 0, 788764, tzinfo=timezone.utc)
+
+
+def test_crypto_research_failures_are_rate_limited_warnings(monkeypatch, caplog):
+    timestamps = iter((1000.0, 1010.0, 1300.0))
+    monkeypatch.setattr(runner_module.time, "monotonic", lambda: next(timestamps))
+    runner = AutonomousRunner.__new__(AutonomousRunner)
+    runner.crypto_error_last_logged_at = None
+
+    with caplog.at_level(logging.WARNING, logger="apex.autonomous"):
+        runner._log_crypto_research_failure(RuntimeError("feed unavailable"))
+        runner._log_crypto_research_failure(RuntimeError("feed unavailable"))
+        runner._log_crypto_research_failure(RuntimeError("feed unavailable"))
+
+    assert len(caplog.records) == 2
+    assert all(record.levelno == logging.WARNING for record in caplog.records)
+    assert all("equity processing will continue" in record.message for record in caplog.records)
 
 
 def test_alpaca_client_routes_crypto_market_data_to_crypto_endpoints():
@@ -204,7 +273,7 @@ def test_signal_uses_paper_limit_bracket_tranches_and_heartbeat_telemetry(
             }
 
     client = FakeClient()
-    runner = AutonomousRunner(settings, client)
+    runner = AutonomousRunner(settings, client, risk_gate=ApprovingRiskGate())
     runner.symbols = ("SPY",)
     state = SymbolState("SPY")
     runner.states = {"SPY": state}
@@ -258,6 +327,23 @@ def test_signal_uses_paper_limit_bracket_tranches_and_heartbeat_telemetry(
     record = json.loads(heartbeat.read_text(encoding="utf-8"))
     assert record["telemetry"]["accepted"] is True
     assert record["telemetry"]["rvol"] is None
+
+    class RejectingRiskGate:
+        def authorize(self, _request):
+            return {"approved": False, "reason": "independent risk limit"}
+
+    runner.risk_gate = RejectingRiskGate()
+    runner.managed.pop("SPY")
+    runner._submit_signal(
+        "SPY", {"t": "2026-10-29T15:00:00+00:00", "c": 100.5},
+        100_000, {}, {}, bar_time=datetime(2026, 10, 29, 15, 1, tzinfo=timezone.utc),
+    )
+    assert len(client.payloads) == 2
+    rejected = json.loads(heartbeat.read_text(encoding="utf-8"))
+    assert rejected["telemetry"]["accepted"] is False
+    assert rejected["telemetry"]["reason"] == "independent risk limit"
+
+    runner.risk_gate = ApprovingRiskGate()
     runner._submit_signal(
         "SPY", {"t": "2026-10-29T15:00:00+00:00", "c": 100.5},
         100_000, {}, {}, bar_time=datetime(2026, 10, 29, 15, 1, tzinfo=timezone.utc),
@@ -267,6 +353,17 @@ def test_signal_uses_paper_limit_bracket_tranches_and_heartbeat_telemetry(
     rejected = json.loads(heartbeat.read_text(encoding="utf-8"))
     assert rejected["telemetry"]["accepted"] is False
     assert "CPI" in rejected["telemetry"]["reason"]
+
+    runner.alpha.evaluate = lambda *_args: Decision(
+        "SPY", Side.LONG, 0.2, False, reject_reason="signal score below threshold",
+    )
+    runner._submit_signal(
+        "SPY", {"t": "2026-10-29T15:00:00+00:00", "c": 100.5},
+        100_000, {}, {}, bar_time=datetime(2026, 10, 29, 15, 1, tzinfo=timezone.utc),
+    )
+    no_signal = json.loads(heartbeat.read_text(encoding="utf-8"))
+    assert no_signal["telemetry"]["accepted"] is False
+    assert no_signal["telemetry"]["required_score"] == pytest.approx(0.7)
 
 
 def test_partial_take_profit_moves_all_runner_stops_to_breakeven(monkeypatch):
@@ -294,7 +391,7 @@ def test_partial_take_profit_moves_all_runner_stops_to_breakeven(monkeypatch):
             self.updated.append((order_id, payload))
 
     client = FakeClient()
-    runner = AutonomousRunner(settings, client)
+    runner = AutonomousRunner(settings, client, risk_gate=ApprovingRiskGate())
     state = SymbolState("SPY")
     state.last_price = 103
     for index in range(20):
@@ -364,6 +461,9 @@ def test_dry_run_defers_dynamic_selection_when_market_is_closed(monkeypatch, cap
         runner_module, "AutonomousRunner",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("selection should be deferred")),
     )
+    monkeypatch.setattr(
+        runner_module, "RiskGateClient", lambda: ApprovingRiskGate(),
+    )
     assert runner_module.dry_run(FakeClient(), settings) == 2
     assert "deferred until premarket" in capsys.readouterr().out
 
@@ -396,7 +496,7 @@ def test_runner_closes_only_identified_filled_paper_test_position(monkeypatch):
             return {"id": "close-order"}
 
     client = FakeClient()
-    runner = AutonomousRunner(settings, client)
+    runner = AutonomousRunner(settings, client, risk_gate=ApprovingRiskGate())
     assert runner._cleanup_identified_test_positions(market_open=True)
     assert client.closed == ["SPY"]
 
@@ -463,13 +563,13 @@ def test_daily_drawdown_halt_persists_across_runner_restart(monkeypatch, tmp_pat
             return {"id": "close-order"}
 
     client = FakeClient()
-    first = AutonomousRunner(settings, client)
+    first = AutonomousRunner(settings, client, risk_gate=ApprovingRiskGate())
     first._start_session(now, {"equity": "100000"})
     assert first._kill_switch(now, {"SPY": {"symbol": "SPY"}})
     assert first.halted
     persisted = json.loads((tmp_path / "logs" / "session_guard.json").read_text())
     assert persisted["halted"] is True
-    restarted = AutonomousRunner(settings, client)
+    restarted = AutonomousRunner(settings, client, risk_gate=ApprovingRiskGate())
     restarted._start_session(now, {"equity": "100000"})
     assert restarted.halted
     assert restarted._kill_switch(now, {})
@@ -496,7 +596,7 @@ def test_closing_bell_flatten_submits_cancels_and_closes(monkeypatch):
             return {"id": "close-order"}
 
     client = FakeClient()
-    runner = AutonomousRunner(settings, client)
+    runner = AutonomousRunner(settings, client, risk_gate=ApprovingRiskGate())
     session_day = datetime(2026, 10, 28).date()
     runner._flatten_positions({"SPY": {"symbol": "SPY"}}, session_day)
     runner._flatten_positions({"SPY": {"symbol": "SPY"}}, session_day)
@@ -598,6 +698,39 @@ def test_paper_dashboard_snapshot_is_atomic_and_excludes_sensitive_account_field
     assert list(snapshot_path.parent.glob("*.tmp")) == []
 
 
+def test_market_dashboard_snapshot_is_allowlisted_and_limits_candles(monkeypatch, tmp_path):
+    monkeypatch.setattr(runner_module, "ROOT", tmp_path)
+    write_dashboard_market_snapshot({
+        "SPY": {
+            "asset_class": "equity",
+            "display_symbol": "SPY",
+            "price": 600.0,
+            "bid": 599.9,
+            "ask": 600.1,
+            "timestamp": "2026-11-07T14:30:00+00:00",
+            "trend_50d": "above",
+            "sma50": 590.0,
+            "atr": 2.0,
+            "atr_pct": 0.33,
+            "bbwp": 12.0,
+            "regime": "above 50-day trend",
+            "api_key": "must-not-publish",
+            "candles": [
+                {"time": f"2026-11-07T14:{index % 60:02d}:00+00:00", "close": 600 + index}
+                for index in range(125)
+            ],
+        },
+    })
+
+    snapshot_path = tmp_path / "logs" / "market_dashboard_snapshot.json"
+    snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    assert snapshot["symbols"]["SPY"]["price"] == 600.0
+    assert "api_key" not in snapshot["symbols"]["SPY"]
+    assert len(snapshot["symbols"]["SPY"]["candles"]) == 120
+    assert "must-not-publish" not in snapshot_path.read_text(encoding="utf-8")
+    assert list(snapshot_path.parent.glob("*.tmp")) == []
+
+
 def test_closed_market_dashboard_refresh_is_read_only(monkeypatch):
     runner = AutonomousRunner.__new__(AutonomousRunner)
     calls = []
@@ -625,6 +758,58 @@ def test_closed_market_dashboard_refresh_is_read_only(monkeypatch):
     runner._publish_dashboard_snapshot_while_closed()
 
     assert calls == ["account", "positions", ("orders", 20), "snapshot"]
+
+
+def test_closed_market_market_snapshot_uses_read_only_recent_bars(monkeypatch):
+    now = datetime(2026, 11, 8, 18, 0, tzinfo=timezone.utc)
+    runner = AutonomousRunner.__new__(AutonomousRunner)
+    runner.symbols = ("SPY",)
+    runner.crypto_market_data = {}
+    runner.dashboard_market_last_refresh_at = None
+    calls = []
+
+    def row(timestamp, close):
+        return {
+            "t": timestamp.isoformat(),
+            "o": close - 0.1,
+            "h": close + 0.2,
+            "l": close - 0.2,
+            "c": close,
+            "v": 1000,
+        }
+
+    minute_rows = [
+        row(now - timedelta(days=2, minutes=20 - index), 600 + index * 0.1)
+        for index in range(20)
+    ]
+    daily_rows = [
+        row(now - timedelta(days=index + 1), 590 + index * 0.1)
+        for index in range(55)
+    ]
+
+    class Client:
+        def bars(self, symbols, timeframe, _start, _end, limit):
+            calls.append((symbols, timeframe, limit))
+            return {"SPY": minute_rows if timeframe == "1Min" else daily_rows}
+
+    runner.client = Client()
+    published = {}
+    monkeypatch.setattr(
+        runner_module,
+        "write_dashboard_market_snapshot",
+        lambda market: published.update(market),
+    )
+
+    runner._publish_dashboard_market_snapshot_while_closed(now)
+
+    assert calls == [
+        (("SPY",), "1Min", 10000),
+        (("SPY",), "1Day", 500),
+    ]
+    assert published["SPY"]["price"] == pytest.approx(601.9)
+    assert published["SPY"]["trend_50d"] in {"above", "below"}
+    assert len(published["SPY"]["candles"]) == 20
+    assert runner.dashboard_market_last_refresh_at == now
 
 
 def test_run_forever_keeps_transient_alpaca_failures_in_retry_state(monkeypatch):
@@ -683,16 +868,19 @@ def test_run_forever_refreshes_heartbeat_each_loop(monkeypatch, tmp_path):
     runner.heartbeat_status = "active"
     runner.heartbeat_message = "Market open; runner cycle connected."
     writes = []
+    heartbeat_writes_ready = threading.Event()
     write = runner_module.write_heartbeat
 
     def record_write(status, message="", symbols=()):
         writes.append(time.time())
+        if len(writes) >= 3:
+            heartbeat_writes_ready.set()
         write(status, message, symbols)
 
     monkeypatch.setattr(runner_module, "write_heartbeat", record_write)
 
     def stop_after_cycle():
-        time.sleep(0.05)
+        assert heartbeat_writes_ready.wait(timeout=2)
         raise asyncio.CancelledError
 
     runner.run_once = stop_after_cycle

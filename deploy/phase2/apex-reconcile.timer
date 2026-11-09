@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Apex Quant read-only broker reconciliation every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+Persistent=true
+Unit=apex-reconcile.service
+
+[Install]
+WantedBy=timers.target

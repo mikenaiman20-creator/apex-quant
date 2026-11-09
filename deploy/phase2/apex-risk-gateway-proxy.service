@@ -1,0 +1,14 @@
+[Unit]
+Description=Forward loopback connections to the isolated Apex risk gateway
+Requires=apex-risk-gateway-proxy.socket
+After=apex-risk-gateway-proxy.socket
+
+[Service]
+Type=simple
+User=nobody
+Group=nogroup
+ExecStart=/lib/systemd/systemd-socket-proxyd 172.20.0.2:8765
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true

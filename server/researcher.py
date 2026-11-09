@@ -226,6 +226,7 @@ class StrategyResearcher:
     def discovery_once(self, force: bool = False) -> dict[str, Any]:
         """Run bounded, cost-adjusted WFO on local equity data, independently of market hours."""
         from backtest.data import load_dir
+        from backtest.cpcv import evaluate_cpcv
         from backtest.engine import BTConfig
         from backtest.holdout import validate_final_holdout
         from backtest.metrics import summarize, trade_equity_curve
@@ -237,7 +238,7 @@ class StrategyResearcher:
 
         now = datetime.now(timezone.utc)
         trial_ledger_path = self.root / "logs" / "strategy_trial_ledger.json"
-        trial_ledger = load_trial_ledger(trial_ledger_path)
+        trial_ledger = load_trial_ledger(trial_ledger_path, strict=True)
         files = self._discovery_files()
         cycle_id = ""
         grid_size = math.prod(len(values) for values in DISCOVERY_GRID.values())
@@ -358,6 +359,7 @@ class StrategyResearcher:
             cycle_id, planned_trials, "evaluating_variants", running_state["message"],
             trial_ledger_path,
         )
+        register_trials(cycle_id, planned_trials, trial_ledger_path)
 
         config = BTConfig(
             slippage_bps=float(os.getenv("BACKTEST_SLIPPAGE_BPS", "1.0")),
@@ -375,6 +377,8 @@ class StrategyResearcher:
             test_days=int(os.getenv("RESEARCH_TEST_DAYS", "10")),
             min_train_trades=int(os.getenv("RESEARCH_MIN_TRAIN_TRADES", "8")),
             workers=1,
+            trial_cycle_id=cycle_id,
+            trial_ledger_path=trial_ledger_path,
         )
         variant_reports = []
         for key, trades in results.items():
@@ -403,6 +407,10 @@ class StrategyResearcher:
         trial_count = register_trials(
             cycle_id, len(results), trial_ledger_path,
             win_rate_records=variant_reports,
+        )
+        cpcv_report = evaluate_cpcv(
+            data, config, results, n_trials=trial_count, grid=DISCOVERY_GRID,
+            workers=1,
         )
         candidate_report = None
         if folds:
@@ -453,6 +461,8 @@ class StrategyResearcher:
                 "profit_factor": self._json_number(metrics["profit_factor"]),
                 "max_drawdown_pct": self._json_number(metrics["max_dd_pct"]),
                 "n_trials": trial_count,
+                "pbo": cpcv_report["pbo"],
+                "cpcv": cpcv_report,
                 "expected_slippage_drag": self._json_number(slippage_drag),
                 "simulated_slippage_drag": self._json_number(slippage_drag),
                 "simulated_transaction_costs": self._json_number(metrics["costs"]),
@@ -469,6 +479,9 @@ class StrategyResearcher:
                 "status": audit["status"],
                 "params": latest_params,
                 "paper_trades": len(selected_trades),
+                "pbo": cpcv_report["pbo"],
+                "cpcv": cpcv_report,
+                "n_trials": trial_count,
                 "holdout": holdout,
                 "reason": audit["reason"],
             }
@@ -499,6 +512,9 @@ class StrategyResearcher:
             "variants_tested": len(results),
             "cumulative_trials": cumulative,
             "qualified_folds": len(folds),
+            "cpcv": cpcv_report,
+            "pbo": cpcv_report["pbo"],
+            "dsr_probability": cpcv_report["dsr"]["adjusted_sharpe"],
             "variants": variant_reports,
             "candidate": candidate_report,
             "execution_enabled": False,
