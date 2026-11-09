@@ -233,6 +233,15 @@ if the certificate, callback scheme, or `Host` header disagree. Use a domain you
 long-lived deployment, and keep the certificate hostname, `DASHBOARD_DOMAIN`,
 `OAUTH2_PROXY_COOKIE_DOMAIN`, and `OAUTH2_PROXY_REDIRECT_URL` aligned.
 
+Keep `--cookie-csrf-per-request=true` enabled. oauth2-proxy v7 defaults it to `false`, so every
+login attempt shares one `_oauth2_proxy_csrf` cookie. A retry, a second tab, or a prefetch
+overwrites the cookie for an earlier attempt and the callback returns `403` with
+`Login Failed: Unable to find a valid CSRF token`. Per-request cookie names isolate concurrent
+attempts and ignore stale cookies from an older host or cookie secret. If the page still fails,
+clear site data for the dashboard host, open exactly one tab, and check
+`docker logs --tail 100 <oauth2-proxy container>` for `unable to obtain CSRF cookie` (missing or
+undecryptable cookie) versus `CSRF token mismatch` (cookie overwritten by a newer login attempt).
+
 ### Risk gateway configuration fallback
 
 The autonomous runner is hard-fail in production and LIVE mode. In non-production PAPER mode a

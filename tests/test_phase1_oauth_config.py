@@ -11,6 +11,10 @@ def test_github_oauth_has_required_scope_and_exact_redirect_allowlist():
 
     assert "--scope=user:email read:org" in compose
     assert "--authenticated-emails-file=/etc/oauth2-proxy/allowed_emails" in compose
+    # Every login attempt needs its own CSRF cookie. With the v7 default
+    # (false) a retry or a second tab overwrites the cookie and the callback
+    # fails with "Unable to find a valid CSRF token".
+    assert "--cookie-csrf-per-request=true" in compose
     # Domain-specific flags moved to the environment file so local and staging
     # deployments cannot drift between http:// and https:// callbacks.
     assert "--redirect-url" not in compose

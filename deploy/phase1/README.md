@@ -65,6 +65,14 @@ dashboard scheme exactly (`https://` here); mixing `http://` and `https://` caus
 failures and browser certificate warnings. Nginx forwards `X-Forwarded-Proto`, `X-Forwarded-Host`,
 and `X-Forwarded-Port`, and oauth2-proxy runs with `--reverse-proxy=true` and a secure cookie.
 
+Keep `--cookie-csrf-per-request=true` in the Compose command. oauth2-proxy v7 defaults this to
+`false`, which gives every login attempt the same `_oauth2_proxy_csrf` cookie. A retry, a second
+tab, or a browser prefetch then overwrites the cookie for the first attempt, and the GitHub
+callback returns `403 Forbidden` with `Login Failed: Unable to find a valid CSRF token`. Per-request
+cookie names let concurrent attempts coexist and also ignore a stale cookie left by an earlier
+host or cookie secret. After changing this flag, recreate the container
+(`docker compose ... up -d --force-recreate oauth2-proxy`) and sign in from a single tab.
+
 ```sh
 OAUTH2_PROXY_REDIRECT_URL=https://151.145.93.209.nip.io/oauth2/callback
 OAUTH2_PROXY_COOKIE_DOMAIN=151.145.93.209.nip.io

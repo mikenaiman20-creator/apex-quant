@@ -106,6 +106,12 @@ services:
       - --reverse-proxy=true
       - --set-xauthrequest=true
       - --cookie-samesite=lax
+      # Give every login attempt its own CSRF cookie. oauth2-proxy v7 defaults
+      # this to false, so a second /oauth2/start (a retry, a second tab, or a
+      # prefetch) overwrites the first cookie and the GitHub callback fails
+      # with "Unable to find a valid CSRF token". Per-request names also stop
+      # a stale cookie from another host/secret from shadowing the new one.
+      - --cookie-csrf-per-request=true
       - --standard-logging=true
       - --auth-logging=true
     volumes:
