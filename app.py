@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
@@ -38,6 +39,7 @@ _RUNTIME_STATUS_TERMS = {
     "asset", "assets", "crypto", "equity", "equities", "monitored", "order",
     "orders", "paper", "routing", "symbol", "symbols",
 }
+log = logging.getLogger("apex.dashboard")
 
 
 def _read_json(path: Path) -> tuple[dict[str, Any] | None, str | None]:
@@ -102,45 +104,76 @@ def _read_events(path: Path, limit: int = 100) -> list[dict[str, str]]:
     return list(reversed(events))
 
 
+def _open_readonly_database(
+    path: Path,
+) -> tuple[sqlite3.Connection | None, str | None, list[str]]:
+    """Open a read-only SQLite connection, tolerating read-only bind mounts.
+
+    ``mode=ro`` still needs to create the ``-shm`` sidecar for a WAL database.
+    The production dashboard mounts ``data/`` read-only, so that open fails with
+    "unable to open database file".  ``immutable=1`` tells SQLite the file will
+    not change and skips locking/WAL sidecars; the writer checkpoints after every
+    commit so the main file is current.  Both errors are returned for logging.
+    """
+    errors: list[str] = []
+    for suffix in ("?mode=ro", "?mode=ro&immutable=1"):
+        uri = f"{path.as_uri()}{suffix}"
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(uri, uri=True, timeout=2)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only=ON")
+            return connection, suffix, errors
+        except (OSError, sqlite3.Error) as exc:
+            errors.append(f"{suffix}: {exc}")
+            if connection is not None:
+                try:
+                    connection.close()
+                except sqlite3.Error:
+                    pass
+    return None, None, errors
+
+
 @st.cache_data(ttl=30, show_spinner=False)
 def _read_knowledge_database(path_text: str, modified_ns: int) -> dict[str, Any]:
     path = Path(path_text)
     if not _safe_is_file(path):
         return {"error": "Knowledge Brain SQLite database is not present or readable in the production data mount."}
-    last_error: Exception | None = None
-    for suffix in ("?mode=ro", "?mode=ro&immutable=1"):
-        uri = f"{path.as_uri()}{suffix}"
-        try:
-            connection = sqlite3.connect(uri, uri=True, timeout=2)
-            connection.row_factory = sqlite3.Row
-            try:
-                connection.execute("PRAGMA query_only=ON")
-                integrity = connection.execute("PRAGMA quick_check").fetchone()[0]
-                counts = {
-                    row["status"]: row["count"]
-                    for row in connection.execute(
-                        "SELECT status, COUNT(*) AS count FROM strategies GROUP BY status"
-                    )
-                }
-                source_count = connection.execute(
-                    "SELECT COUNT(*) FROM ingestion_sources"
-                ).fetchone()[0]
-                rows = connection.execute(
-                    """
-                    SELECT id, category, conviction_score, status, created_at, strategy_json
-                    FROM strategies
-                    ORDER BY created_at DESC, id DESC
-                    LIMIT 100
-                    """
-                ).fetchall()
-            finally:
-                connection.close()
-            break
-        except (OSError, sqlite3.Error) as exc:
-            last_error = exc
-            continue
-    else:
-        return {"error": f"Knowledge Brain SQLite read failed: {last_error}"}
+    connection, mode, errors = _open_readonly_database(path)
+    if connection is None:
+        detail = "; ".join(errors) or "unknown error"
+        log.error("Knowledge Brain SQLite read failed for %s: %s", path, detail)
+        return {"error": f"Knowledge Brain SQLite read failed: {detail}"}
+    try:
+        integrity = connection.execute("PRAGMA quick_check").fetchone()[0]
+        counts = {
+            row["status"]: row["count"]
+            for row in connection.execute(
+                "SELECT status, COUNT(*) AS count FROM strategies GROUP BY status"
+            )
+        }
+        source_count = connection.execute(
+            "SELECT COUNT(*) FROM ingestion_sources"
+        ).fetchone()[0]
+        rows = connection.execute(
+            """
+            SELECT id, category, conviction_score, status, created_at, strategy_json
+            FROM strategies
+            ORDER BY created_at DESC, id DESC
+            LIMIT 100
+            """
+        ).fetchall()
+    except (OSError, sqlite3.Error) as exc:
+        log.error("Knowledge Brain SQLite query failed for %s: %s", path, exc)
+        return {"error": f"Knowledge Brain SQLite read failed: {exc}"}
+    finally:
+        connection.close()
+    if mode != "?mode=ro":
+        log.info(
+            "Knowledge Brain SQLite opened with %s because the primary read-only "
+            "open failed on the read-only data mount.",
+            mode,
+        )
 
     strategies = []
     for row in rows:

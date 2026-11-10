@@ -98,3 +98,84 @@ the real CPCV/PBO/DSR gate.  This is documented in the test module docstring.
   fails `tests/calibration/` and blocks the merge.
 - The boundary report is committed at `artifacts/calibration_report.md`; a
   regenerated report that changes the pass-rate table is visible in review.
+
+## SQLite Persistence Hardening
+
+- **Date:** 2026-11-10
+- **Status:** Accepted
+- **Phase:** operations (Knowledge Brain runtime)
+
+### Decision
+
+The Knowledge Brain writer and the dashboard reader are hardened independently:
+
+- `KnowledgeBrain` creates its parent directory with
+  `ensure_directory()` before every connection, opens SQLite with a 30-second
+  busy timeout, WAL journaling, and `synchronous=NORMAL`, and retries transient
+  "unable to open database file" / "database is locked" errors with exponential
+  backoff. A permanently unreadable path is logged and raised with the original
+  error instead of being silently swallowed.
+- A corrupt database (`file is not a database`, malformed image) is moved aside
+  as `knowledge_brain.sqlite.corrupt-<UTC timestamp>` together with its `-wal`
+  and `-shm` sidecars, then a fresh empty database is initialized. The corrupt
+  bytes are preserved for forensics rather than deleted.
+- After every commit the writer runs a passive WAL checkpoint so the main
+  database file is current.
+- The dashboard tries `mode=ro` first and falls back to
+  `mode=ro&immutable=1`. On the read-only `data/` bind mount, `mode=ro` cannot
+  create the `-shm` sidecar that a WAL database needs, which is the exact source
+  of `Knowledge Brain SQLite read failed: unable to open database file`. Both
+  errors are logged when neither mode works.
+- The dashboard read is never allowed to crash the page; it returns a structured
+  `{"error": ...}` and the UI shows a warning.
+
+A shared `server/time_utils.parse_iso_timestamp()` also normalizes every
+fractional-second width to six digits. The runner's Python 3.10 environment
+rejects Alpaca's nine-digit timestamps (`Invalid isoformat string`), which was
+the actual cause of the live `Runner cycle failed; reconnecting.` loop. The
+parser is used by the universe selector, the researcher, and the runner's bar
+conversion.
+
+### Context
+
+The live dashboard and runner produced two independent failures that looked
+related:
+
+1. The Streamlit container mounts `/home/ubuntu/apex_quant/data` read-only and
+   runs as UID 1001. The database is owned by UID 1001 and readable, so this was
+   not a Unix permission problem. It is a SQLite WAL/mount problem: a read-only
+   WAL connection needs to create or open `knowledge_brain.sqlite-shm`, and a
+   read-only filesystem refuses. `immutable=1` skips that requirement.
+2. The autonomous runner runs on the host with Python 3.10.22. Alpaca quotes
+   carry nanosecond timestamps such as
+   `2026-11-10T18:21:26.82295514+00:00`, which `datetime.fromisoformat` on 3.10
+   rejects because it accepts only 0, 3, or 6 fractional digits. The runner
+   crashed in `server/universe.py` before it ever reached the Knowledge Brain.
+
+### Alternatives considered
+
+- **Mount `data/` read-write in the dashboard.** Rejected: the dashboard is a
+  read-only consumer by design, and widening the mount weakens the security
+  boundary for every file in `data/`.
+- **Switch the database to `journal_mode=DELETE`.** Rejected: WAL is the better
+  concurrent-writer mode and the production gate explicitly asks for it. The
+  read-only fallback is the correct fix for the reader.
+- **Delete a corrupt database and start over.** Rejected: silent data loss.
+  Quarantining preserves the corrupt file for diagnosis.
+- **Retry forever on a permission error.** Rejected: a permanent
+  misconfiguration must surface. Retries are bounded and the final error is
+  logged with the path.
+
+### Consequences
+
+- `tests/test_knowledge_brain_sqlite.py` covers parent-directory creation,
+  concurrent readers/writers, restricted-permission logging, corrupt-file
+  quarantine, the immutable read-only fallback, and the graceful dashboard
+  error. It runs in the standard suite (the `verify` CI job).
+- The writer checkpoints after each commit; this is cheap for the low-volume
+  research database and keeps immutable readers current.
+- The dashboard may briefly read a snapshot up to 30 seconds old (its existing
+  cache TTL). That is unchanged.
+- Deployments must restart the Streamlit container after updating `app.py`
+  (the file is a bind mount) and restart the host runner service after updating
+  `server/`.

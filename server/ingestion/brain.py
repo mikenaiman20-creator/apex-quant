@@ -8,6 +8,7 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from pprint import pformat
 from typing import Any
@@ -23,34 +24,123 @@ MIN_LOGICAL_RIGOR = 0.80
 MIN_COMBINED_CONVICTION = 0.80
 _BRAIN_LOCK = threading.RLock()
 DEFAULT_BRAIN_PATH = Path(__file__).resolve().parents[2] / "data" / "knowledge_brain.sqlite"
+OPEN_RETRIES = 5
+RETRY_BASE_SECONDS = 0.1
+_OPEN_CONTENTION_MESSAGES = (
+    "unable to open database file",
+    "database is locked",
+    "database table is locked",
+)
+_CORRUPTION_MESSAGES = (
+    "file is not a database",
+    "database disk image is malformed",
+    "malformed database schema",
+)
+
+
+def _is_open_contention_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return any(fragment in message for fragment in _OPEN_CONTENTION_MESSAGES)
+
+
+def _is_corruption_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return any(fragment in message for fragment in _CORRUPTION_MESSAGES)
+
 
 
 class KnowledgeBrain:
     def __init__(self, path: Path = DEFAULT_BRAIN_PATH):
         self.path = Path(path)
         ensure_directory(self.path.parent)
-        self._initialize()
+        try:
+            self._initialize()
+        except sqlite3.DatabaseError as exc:
+            if not _is_corruption_error(exc):
+                raise
+            log.error(
+                "Knowledge Brain database %s is corrupt (%s); quarantining it and "
+                "reinitializing an empty database.",
+                self.path,
+                exc,
+            )
+            self._quarantine_corrupt_database()
+            self._initialize()
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect_once(self) -> sqlite3.Connection:
         ensure_directory(self.path.parent)
         connection = sqlite3.connect(self.path, timeout=30)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout=30000")
         try:
-            connection.execute("PRAGMA journal_mode=WAL")
-        except sqlite3.Error:
-            log.warning("SQLite WAL is unavailable for %s; falling back to rollback journal.",
-                        self.path)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA busy_timeout=30000")
             try:
-                connection.execute("PRAGMA journal_mode=DELETE")
-            except sqlite3.Error:
+                connection.execute("PRAGMA journal_mode=WAL")
+            except sqlite3.OperationalError:
+                log.warning("SQLite WAL is unavailable for %s; falling back to rollback journal.",
+                            self.path)
+                try:
+                    connection.execute("PRAGMA journal_mode=DELETE")
+                except sqlite3.OperationalError:
+                    pass
+            try:
+                connection.execute("PRAGMA synchronous=NORMAL")
+            except sqlite3.OperationalError:
                 pass
-        try:
-            connection.execute("PRAGMA synchronous=NORMAL")
-        except sqlite3.Error:
-            pass
-        secure_file(self.path)
+            secure_file(self.path)
+        except BaseException:
+            connection.close()
+            raise
         return connection
+
+    def _connect(self) -> sqlite3.Connection:
+        """Open the database, retrying transient lock/permission failures.
+
+        A bind-mounted SQLite file can be briefly unavailable while the host
+        rotates it, while another process holds an exclusive lock, or while the
+        container entrypoint is still relaxing permissions.  Retrying with
+        exponential backoff keeps the runner cycle alive instead of crashing.
+        """
+        ensure_directory(self.path.parent)
+        last_error: sqlite3.OperationalError | None = None
+        for attempt in range(OPEN_RETRIES):
+            try:
+                return self._connect_once()
+            except sqlite3.OperationalError as exc:
+                last_error = exc
+                if not _is_open_contention_error(exc) or attempt == OPEN_RETRIES - 1:
+                    log.error(
+                        "Unable to open Knowledge Brain database %s: %s", self.path, exc,
+                    )
+                    raise
+                delay = RETRY_BASE_SECONDS * (2 ** attempt)
+                log.warning(
+                    "Knowledge Brain SQLite open failed (%s); retrying in %.2fs "
+                    "(attempt %d/%d).",
+                    exc,
+                    delay,
+                    attempt + 1,
+                    OPEN_RETRIES,
+                )
+                time.sleep(delay)
+        raise last_error  # pragma: no cover - the loop either returns or raises
+
+    def _quarantine_corrupt_database(self) -> Path | None:
+        """Move a corrupt database and its WAL/SHM sidecars aside, preserving them."""
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        quarantined: Path | None = None
+        for suffix in ("", "-wal", "-shm"):
+            source = self.path.with_name(self.path.name + suffix)
+            if not source.exists():
+                continue
+            target = source.with_name(f"{source.name}.corrupt-{stamp}")
+            try:
+                os.replace(source, target)
+                if suffix == "":
+                    quarantined = target
+                log.warning("Quarantined corrupt SQLite file %s -> %s", source, target)
+            except OSError:
+                log.exception("Unable to quarantine corrupt SQLite file %s.", source)
+        return quarantined
 
     @contextmanager
     def _connection(self):
@@ -58,6 +148,12 @@ class KnowledgeBrain:
         try:
             yield connection
             connection.commit()
+            try:
+                # Keep the main database current so read-only/immutable readers
+                # (the dashboard's read-only bind mount) never observe stale data.
+                connection.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            except sqlite3.Error:
+                pass
         except Exception:
             connection.rollback()
             raise
@@ -66,7 +162,6 @@ class KnowledgeBrain:
 
     def _initialize(self) -> None:
         with _BRAIN_LOCK, self._connection() as connection:
-            connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("""
                 CREATE TABLE IF NOT EXISTS strategies (
                     id INTEGER PRIMARY KEY,
