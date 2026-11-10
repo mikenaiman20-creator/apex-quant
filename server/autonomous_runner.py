@@ -53,6 +53,7 @@ from server.io_utils import (
     ensure_directory,
     secure_file,
 )
+from server.time_utils import parse_iso_timestamp
 from server.risk_engine import RiskGateClient, RiskGateRejected, RiskGateUnavailable
 from server.universe import DynamicUniverseSelector
 from server.event_guard import GuardDecision, MacroEventGuard
@@ -502,8 +503,7 @@ def load_crypto_symbols() -> tuple[str, ...]:
 
 
 def _bar_time(raw: str) -> datetime:
-    normalized = re.sub(r"(\.\d{6})\d+", r"\1", raw)
-    return datetime.fromisoformat(normalized.replace("Z", "+00:00")).astimezone(timezone.utc)
+    return parse_iso_timestamp(raw).astimezone(timezone.utc)
 
 
 def _feed_bar(state: SymbolState, bar: dict[str, Any]) -> None:

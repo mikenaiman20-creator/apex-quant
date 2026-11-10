@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
+from server.time_utils import parse_iso_timestamp
 from server.universe import DynamicUniverseSelector, _read_constituents
 
 
@@ -72,3 +73,31 @@ def test_constituent_file_supports_symbol_column_not_in_first_position(tmp_path)
     path = tmp_path / "universe.csv"
     path.write_text("Name,Ticker\nApple,AAPL\nNvidia,NVDA\n", encoding="utf-8")
     assert _read_constituents(path) == ["AAPL", "NVDA"]
+
+
+def test_parse_iso_timestamp_accepts_alpaca_nanosecond_precision():
+    parsed = parse_iso_timestamp("2026-11-10T18:21:26.82295514+00:00")
+    assert parsed.microsecond == 822955
+    assert parsed.tzinfo is not None
+
+    # Python 3.10 only accepts 3 or 6 fractional digits; pad every other width.
+    assert parse_iso_timestamp("2026-11-10T18:21:26.1Z").microsecond == 100000
+    assert parse_iso_timestamp("2026-11-10T18:21:26.12Z").microsecond == 120000
+    assert parse_iso_timestamp("2026-11-10T18:21:26.1234Z").microsecond == 123400
+
+
+def test_dynamic_selector_accepts_nanosecond_quote_timestamps():
+    class NanosecondClient(FakeClient):
+        def latest_quotes(self, symbols):
+            return {
+                symbol: {
+                    "bp": 99.95,
+                    "ap": 100.05,
+                    "t": "2026-10-28T13:15:00.123456789+00:00",
+                }
+                for symbol in symbols
+            }
+
+    selector = DynamicUniverseSelector(NanosecondClient(), top_n=1)
+    selected = selector.select(datetime(2026, 10, 28, 13, 15, tzinfo=timezone.utc))
+    assert len(selected) == 1

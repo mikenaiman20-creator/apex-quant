@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from server.time_utils import parse_iso_timestamp
+
 log = logging.getLogger("apex.autonomous")
 NY = ZoneInfo("America/New_York")
 MARKET_OPEN = time(9, 30)
@@ -135,7 +137,7 @@ class DynamicUniverseSelector:
         for symbol in symbols:
             bars = [
                 row for row in sorted(daily.get(symbol, []), key=lambda row: row["t"])
-                if datetime.fromisoformat(row["t"].replace("Z", "+00:00")).astimezone(NY).date() < end.date()
+                if parse_iso_timestamp(row["t"]).astimezone(NY).date() < end.date()
             ][-21:]
             if len(bars) < 15:
                 continue
@@ -171,7 +173,7 @@ class DynamicUniverseSelector:
                 raw = quotes.get(symbol)
                 if not raw:
                     continue
-                quote_time = datetime.fromisoformat(raw["t"].replace("Z", "+00:00"))
+                quote_time = parse_iso_timestamp(raw["t"])
                 quote_age = (end.astimezone(quote_time.tzinfo) - quote_time).total_seconds()
                 if quote_age < -30 or quote_age > 300:
                     continue

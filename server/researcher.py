@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 from engine.data_pipeline import Bar
 from engine.strategy import average_directional_index, simple_moving_average
 from server.io_utils import atomic_write_json
+from server.time_utils import parse_iso_timestamp
 
 log = logging.getLogger("apex.research")
 ROOT = Path(__file__).resolve().parents[1]
@@ -551,7 +552,7 @@ class StrategyResearcher:
                 def convert(rows, interval):
                     converted = []
                     for item in rows:
-                        start = datetime.fromisoformat(item["t"].replace("Z", "+00:00"))
+                        start = parse_iso_timestamp(item["t"])
                         if start + interval <= now:
                             converted.append(Bar(
                                 start, float(item["o"]), float(item["h"]), float(item["l"]),
