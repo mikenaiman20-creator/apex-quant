@@ -407,6 +407,9 @@ request and every push to `main` (`.github/workflows/ci.yml`). Beyond the tests,
 tracked bytecode, secrets, or holdout data, whitespace errors, uncompilable modules, and a
 fail-closed calibration smoke test that re-proves the synthetic signal clears DSR.
 
+A separate `calibration` job runs the Phase 1 gate-calibration suite as a blocking check (see
+below). The main `verify` job excludes `tests/calibration/` so the suite is not run twice.
+
 The blind holdout is never committed. `config/holdout.lock.json` records the canonical SHA-256
 fingerprint of the frozen `data/final_holdout/*.csv` snapshot: a per-file digest plus byte count,
 hashed in sorted filename order so symbol order cannot change the dataset id. That id is also the
@@ -426,3 +429,41 @@ must match the committed lock byte-for-byte or the build fails. A `pending` lock
 file also fails, so an unrecorded dataset can never be silently evaluated. The production holdout
 validator itself also requires a `locked`, matching manifest before it will run a candidate; until
 the lock is `locked`, candidate staging continues to fail closed.
+
+## Gate calibration (Phase 1)
+
+The CPCV + PBO + DSR gate is calibrated in both directions so a broken gate cannot silently accept
+noise or reject a real edge. The suite lives in `tests/calibration/` and exercises the production
+`backtest.cpcv.evaluate_cpcv` code; the thresholds are unchanged at **PBO < 0.20** and
+**DSR >= 0.95**.
+
+| Test | What it proves |
+| --- | --- |
+| `test_known_positive.py` | A planted 5-day reversal with asset-level IC ~0.15 and after-cost Sharpe 0.50 is accepted. |
+| `test_known_negative.py` | Pure noise (IC 0.00) is rejected: PBO >= 0.20, DSR < 0.95, or net Sharpe <= 0. |
+| `test_boundary.py` | Sweeping IC {0.00, 0.05, 0.10, 0.15, 0.20} over 20 fixed seeds gives a non-decreasing pass rate and a monotonically rising mean DSR. |
+
+Run the whole calibration suite locally with:
+
+```sh
+python -m pytest tests/calibration/ -v
+```
+
+The boundary test writes `artifacts/calibration_report.md` (committed) with the pass-rate table and
+the sample-size diagnosis. The suite takes roughly 7–8 minutes; the dedicated `calibration` CI job
+has a 30-minute timeout.
+
+### Why 15 years instead of 3
+
+The Phase 1 brief asked for 3 years of daily bars, a planted Sharpe of 0.50, and DSR >= 0.95.
+Those three requirements are not jointly satisfiable under the production DSR formula:
+
+- 3 years (756 observations) at Sharpe 0.50 gives DSR **0.8065**.
+- About 2,773 observations (~11 years) are required for DSR 0.95 at Sharpe 0.50.
+- 15 years (3,780 observations) at Sharpe 0.50 gives DSR **0.9735**.
+
+The calibration uses 15 years for margin rather than weakening the threshold or inflating the
+planted Sharpe. The panel also decouples asset-level IC from portfolio Sharpe with a calibrated
+zero-alpha overlay, because a fully invested 500-name portfolio at IC 0.15 would have a natural
+Sharpe far above 0.50. Both decisions are recorded in `DECISIONS.md` under **Gate Calibration
+Baseline**.
