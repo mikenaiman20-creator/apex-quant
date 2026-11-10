@@ -41,6 +41,11 @@ class Quote:
     ask: float
     ask_size: float
 
+    @property
+    def mid(self) -> float:
+        """Midpoint price used for marks when no trade has printed yet."""
+        return (self.bid + self.ask) / 2
+
 
 @dataclass
 class Bar:

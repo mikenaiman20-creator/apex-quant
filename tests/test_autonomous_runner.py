@@ -423,6 +423,33 @@ def test_signal_uses_paper_limit_bracket_tranches_and_heartbeat_telemetry(
     assert no_signal["telemetry"]["required_score"] == pytest.approx(0.7)
 
 
+def test_dashboard_market_snapshot_uses_quote_mid(monkeypatch):
+    monkeypatch.setenv("TRADING_MODE", "PAPER")
+    monkeypatch.setenv("BROKER", "ALPACA")
+    monkeypatch.setenv("ALPACA_API_KEY", "test-key")
+    monkeypatch.setenv("ALPACA_API_SECRET", "test-secret")
+    settings = load_paper_settings()
+    runner = AutonomousRunner(settings, object(), risk_gate=ApprovingRiskGate())
+    runner.symbols = ("SPY",)
+    state = SymbolState("SPY")
+    state.last_price = 100.5
+    state.daily_closes = [100.0] * 60
+    runner.states = {"SPY": state}
+    runner.last_quotes["SPY"] = Quote(
+        datetime(2026, 10, 29, 15, 1, tzinfo=timezone.utc), "SPY", 100.0, 100, 100.02, 100
+    )
+
+    captured: dict = {}
+    monkeypatch.setattr(
+        runner_module, "write_dashboard_market_snapshot", captured.update,
+    )
+    runner._publish_dashboard_market_snapshot()
+
+    assert captured["SPY"]["price"] == pytest.approx(100.01)
+    assert captured["SPY"]["bid"] == pytest.approx(100.0)
+    assert captured["SPY"]["ask"] == pytest.approx(100.02)
+
+
 def test_partial_take_profit_moves_all_runner_stops_to_breakeven(monkeypatch):
     monkeypatch.setenv("TRADING_MODE", "PAPER")
     monkeypatch.setenv("BROKER", "ALPACA")
