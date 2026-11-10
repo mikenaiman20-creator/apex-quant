@@ -122,7 +122,11 @@ def _open_readonly_database(
         try:
             connection = sqlite3.connect(uri, uri=True, timeout=2)
             connection.row_factory = sqlite3.Row
+            # ``sqlite3.connect`` is lazy: it does not touch the file until the
+            # first statement runs, so a broken WAL/read-only open only fails
+            # here.  Force a real read so the immutable fallback can trigger.
             connection.execute("PRAGMA query_only=ON")
+            connection.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
             return connection, suffix, errors
         except (OSError, sqlite3.Error) as exc:
             errors.append(f"{suffix}: {exc}")

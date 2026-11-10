@@ -160,6 +160,53 @@ def test_dashboard_reads_wal_database_through_immutable_fallback(
     assert len(result["strategies"]) == 1
 
 
+def test_dashboard_falls_back_when_connect_is_lazy_but_first_query_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """``sqlite3.connect`` does not touch the file; the real failure is lazy.
+
+    On a read-only WAL mount, ``mode=ro`` connect() succeeds and the first
+    statement raises "unable to open database file".  The opener must force a
+    read so the immutable fallback actually triggers.
+    """
+    pytest.importorskip("streamlit")
+    import app as dashboard_app
+
+    path = tmp_path / "data" / "knowledge_brain.sqlite"
+    brain = KnowledgeBrain(path)
+    brain.add_strategy(_extraction("https://example.org/strategy"))
+
+    real_connect = sqlite3.connect
+
+    class LazyBrokenConnection:
+        def __init__(self, connection):
+            self._connection = connection
+            self.row_factory = connection.row_factory
+
+        def execute(self, *args, **kwargs):
+            raise sqlite3.OperationalError("unable to open database file")
+
+        def close(self):
+            self._connection.close()
+
+    def lazy_mount_connect(database, *args, **kwargs):
+        connection = real_connect(database, *args, **kwargs)
+        if isinstance(database, str) and "mode=ro" in database and "immutable" not in database:
+            return LazyBrokenConnection(connection)
+        return connection
+
+    monkeypatch.setattr(dashboard_app.sqlite3, "connect", lazy_mount_connect)
+    dashboard_app._read_knowledge_database.clear()
+
+    result = dashboard_app._read_knowledge_database(
+        str(path), path.stat().st_mtime_ns,
+    )
+
+    assert "error" not in result, result
+    assert result["integrity"] == "ok"
+    assert len(result["strategies"]) == 1
+
+
 def test_dashboard_returns_graceful_error_when_all_open_modes_fail(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
 ):
